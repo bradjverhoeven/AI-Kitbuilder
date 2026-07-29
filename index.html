@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Design Your Garment — The Procurement Room (Prototype)</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<header class="app-header">
+  <div class="brand">The Procurement Room</div>
+  <div class="proto-tag">PROTOTYPE — nothing here is sent or saved live</div>
+</header>
+
+<main class="app-main">
+
+  <!-- LEFT: AI-generated preview -->
+  <section class="preview-pane">
+    <div class="view-toggle" id="image-tabs">
+      <button type="button" class="view-btn active" data-tab="modelFront">Model — Front</button>
+      <button type="button" class="view-btn" data-tab="modelBack" disabled>Model — Back</button>
+    </div>
+
+    <div class="image-wrap">
+      <div id="image-placeholder" class="image-placeholder">Describe your garment in the chat — your design preview will appear here.</div>
+      <div id="image-loading" class="image-loading" style="display:none">
+        <div class="spinner"></div>
+        <span id="image-loading-text">Generating your design…</span>
+      </div>
+      <img id="preview-image" alt="Design preview" style="display:none" />
+    </div>
+    <button type="button" id="download-image-btn" class="btn-secondary" style="display:none">Download this image</button>
+    <p class="hint">AI-generated concept image — final production vector artwork is prepared separately once your order is placed.</p>
+  </section>
+
+  <!-- RIGHT: text-based chat wizard -->
+  <section class="chat-pane">
+    <div id="chat-log" class="chat-log"></div>
+
+    <div id="composer" class="composer"></div>
+  </section>
+</main>
+
+<!-- Quote confirmation modal -->
+<div id="quote-modal" class="modal-overlay hidden">
+  <div class="modal">
+    <h2>Thanks — your design request is in!</h2>
+    <p class="modal-note">
+      Nothing was actually sent (this is a prototype). In the live version, <strong id="modal-reseller-name"></strong>
+      and our team would be emailed right now with these images attached.
+    </p>
+
+    <div id="quote-images" class="quote-images"></div>
+
+    <div class="modal-actions">
+      <button type="button" id="close-modal-btn" class="btn-secondary">Close</button>
+    </div>
+
+    <h3>Captured spec (JSON)</h3>
+    <pre id="quote-json"></pre>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
