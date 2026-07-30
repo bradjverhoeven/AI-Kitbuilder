@@ -59,6 +59,13 @@ const state = {
   contactPhone: "",
   extraGarments: [], // [{ name, image }] — same design applied to other garment types
   history: [], // [{ id, label, front, back }] — every version generated, for click-to-revert
+  // Logo/name/number are never baked into state.images -- they live here as
+  // persistent, always-draggable layers on top of the base photo, and only
+  // get composited into a flat image on demand (download, quote, extra
+  // garments). This is what lets the customer keep repositioning any of
+  // them at any point in the session instead of locking each one in place
+  // the moment it's placed.
+  layers: [], // [{ id, kind, view, type, content, left, top, width, height, curve, rotationDeg, fontFamily, fontWeight, overlay, applyStyle }]
 };
 let historyIdCounter = 0;
 
@@ -126,6 +133,11 @@ const els = {
   tabsContainer: document.getElementById("image-tabs"),
 };
 let activeTab = "modelFront";
+// While a layer is mid-creation (between being created and the customer
+// hitting "Continue"), switching Front/Back should move THAT layer to the
+// tapped side, matching the old "whichever tab is active when you confirm"
+// behavior -- but only during creation, not on every ordinary tab click.
+let placingLayer = null;
 
 function getTabs() { return [...els.tabsContainer.querySelectorAll(".view-btn")]; }
 
@@ -152,6 +164,9 @@ function showTab(tab) {
     els.downloadBtn.style.display = "none";
     els.placeholder.style.display = "block";
   }
+  state.layers.forEach((layer) => {
+    if (layer.overlay) layer.overlay.style.display = layer.view === tab ? "" : "none";
+  });
 }
 
 // Delegated (not per-button) so tabs added later for extra garments work
@@ -159,6 +174,9 @@ function showTab(tab) {
 els.tabsContainer.addEventListener("click", (e) => {
   const btn = e.target.closest(".view-btn");
   if (!btn || btn.disabled) return;
+  if (placingLayer && (btn.dataset.tab === "modelFront" || btn.dataset.tab === "modelBack")) {
+    placingLayer.view = btn.dataset.tab;
+  }
   showTab(btn.dataset.tab);
 });
 
@@ -176,9 +194,10 @@ function addGarmentTab(key, label) {
   els.tabsContainer.appendChild(btn);
 }
 
-els.downloadBtn.addEventListener("click", () => {
+els.downloadBtn.addEventListener("click", async () => {
+  const dataUrl = await compositeView(activeTab);
   const a = document.createElement("a");
-  a.href = state.images[activeTab];
+  a.href = dataUrl;
   a.download = `design-${activeTab}.png`;
   document.body.appendChild(a);
   a.click();
@@ -343,16 +362,21 @@ function drawStyledText(ctx, text, { x, y, width, height, curve = 0, color = "#f
     return;
   }
 
-  // Curve (-100..100): letters follow an arc. Positive curves like a
-  // smile (ends lift up); negative curves like a dome (ends dip down).
+  // Curve (-100..100): letters follow an arc, same convention as text
+  // wrapped around a circle (dome = top half of the circle, smile =
+  // bottom half), not just "sit on top either way":
+  // Negative (dome): ends dip DOWN, middle lifts up -- like the TOP of a
+  // circle, circle center below the text -- letters stand on TOP of the
+  // line, extending away from that center.
+  // Positive (smile): ends lift UP, middle dips down -- like the BOTTOM
+  // of a circle, circle center above the text -- letters HANG BELOW the
+  // line instead, extending away from that (now-above) center.
   // Each letter is placed by its cumulative arc-length position (i.e.
   // where it would sit in the flat layout, converted to an angle) rather
   // than an equal angle slot per character -- otherwise wider/narrower
   // letters end up unevenly spaced or overlapping along the curve.
-  // Baseline (not middle) sits on the curve line, so letters stand on top
-  // of it like text on a path, rather than straddling the line.
-  ctx.textBaseline = "alphabetic";
   const { radius, totalAngle, curveSign } = curveGeometry(curve, totalWidth);
+  ctx.textBaseline = curveSign > 0 ? "top" : "alphabetic";
   const halfAngle = Math.abs(totalAngle) / 2;
 
   let cumulative = 0;
@@ -363,49 +387,81 @@ function drawStyledText(ctx, text, { x, y, width, height, curve = 0, color = "#f
     const angle = t * halfAngle;
     const dx = radius ? radius * Math.sin(angle) : 0;
     const dy = radius ? radius * (Math.cos(angle) - 1) * curveSign : 0;
-    drawChar(ch, cx + dx, cy + dy, angle * curveSign);
+    // Rotation must match the tangent of the (dx,dy) path at this point, not
+    // just the raw angle -- verified by comparing each letter's assigned
+    // rotation against the actual direction to its neighbor; the un-negated
+    // angle was consistently backwards (e.g. first letter tilted left when
+    // the path there tangents right), which read as letters not sitting
+    // cleanly on the line even though their up/down side was already correct.
+    drawChar(ch, cx + dx, cy + dy, -angle * curveSign);
   });
 }
 
-function flattenOverlayToImage(baseDataUrl, type, content, left, top, width, height, containerWidth, containerHeight, textStyle = {}) {
+// Draws one layer (logo image or name/number text) onto an already-scaled
+// canvas context. Shared by compositeView (the only place layers actually
+// get baked into pixels) -- the live on-screen overlay never flattens
+// anything, it just stays a draggable DOM element indefinitely.
+function drawLayerOnCanvas(ctx, layer, scaleX, scaleY) {
   return new Promise((resolve, reject) => {
+    const x = layer.left * scaleX;
+    const y = layer.top * scaleY;
+    const w = layer.width * scaleX;
+    const h = layer.height * scaleY;
+    if (layer.type === "image") {
+      const img = new Image();
+      img.onload = () => {
+        ctx.drawImage(img, x, y, w, h);
+        resolve();
+      };
+      img.onerror = reject;
+      img.src = layer.content;
+    } else {
+      ctx.save();
+      if (layer.rotationDeg) {
+        const cx = x + w / 2;
+        const cy = y + h / 2;
+        ctx.translate(cx, cy);
+        ctx.rotate((layer.rotationDeg * Math.PI) / 180);
+        ctx.translate(-cx, -cy);
+      }
+      drawStyledText(ctx, layer.content, { x, y, width: w, height: h, curve: layer.curve, fontFamily: layer.fontFamily, fontWeight: layer.fontWeight });
+      ctx.restore();
+      resolve();
+    }
+  });
+}
+
+// The base photo (state.images[view]) is NEVER mutated by placing a logo/
+// name/number -- this composites the current base plus every live layer
+// for that view into one flat image, computed fresh every time it's
+// needed (download, quote, extra-garment reference), so it always
+// reflects wherever the customer has currently dragged things.
+function compositeView(view) {
+  return new Promise((resolve, reject) => {
+    const baseDataUrl = state.images[view];
+    if (!baseDataUrl) { resolve(baseDataUrl); return; }
     const baseImg = new Image();
-    baseImg.onload = () => {
+    baseImg.onload = async () => {
       const canvas = document.createElement("canvas");
       canvas.width = baseImg.naturalWidth;
       canvas.height = baseImg.naturalHeight;
       const ctx = canvas.getContext("2d");
       ctx.drawImage(baseImg, 0, 0, canvas.width, canvas.height);
 
+      const containerWidth = imageWrap.clientWidth;
+      const containerHeight = imageWrap.clientHeight;
       const scaleX = canvas.width / containerWidth;
       const scaleY = canvas.height / containerHeight;
-      const x = left * scaleX;
-      const y = top * scaleY;
-      const w = width * scaleX;
-      const h = height * scaleY;
 
-      if (type === "image") {
-        const logoImg = new Image();
-        logoImg.onload = () => {
-          ctx.drawImage(logoImg, x, y, w, h);
-          resolve(canvas.toDataURL("image/png"));
-        };
-        logoImg.onerror = reject;
-        logoImg.src = content;
-      } else {
-        const { curve = 0, rotationDeg = 0, fontFamily, fontWeight } = textStyle;
-        ctx.save();
-        if (rotationDeg) {
-          const cx = x + w / 2;
-          const cy = y + h / 2;
-          ctx.translate(cx, cy);
-          ctx.rotate((rotationDeg * Math.PI) / 180);
-          ctx.translate(-cx, -cy);
+      try {
+        for (const layer of state.layers.filter((l) => l.view === view)) {
+          await drawLayerOnCanvas(ctx, layer, scaleX, scaleY);
         }
-        drawStyledText(ctx, content, { x, y, width: w, height: h, curve, fontFamily, fontWeight });
-        ctx.restore();
-        resolve(canvas.toDataURL("image/png"));
+      } catch (err) {
+        reject(err);
+        return;
       }
+      resolve(canvas.toDataURL("image/png"));
     };
     baseImg.onerror = reject;
     baseImg.src = baseDataUrl;
@@ -418,37 +474,25 @@ const DEFAULT_PLACEMENTS = {
   number: { view: "modelBack", leftPct: 0.5, topPct: 0.40, size: 60 },
 };
 
-function mountDraggablePlacement({ kind, type, content, onConfirm, onCancel, fontOpt }) {
-  const defaults = DEFAULT_PLACEMENTS[kind];
-  showTab(defaults.view);
-  // Tabs stay enabled on purpose -- the customer can switch Front/Back
-  // while positioning (e.g. to put the same logo on both sides across
-  // repeat placements). Whichever tab is active at "Confirm" time is the
-  // one the overlay gets flattened onto (read via `activeTab`).
+// Mounts a layer as a permanently-draggable/resizable(/rotatable for name)
+// DOM overlay bound directly to the layer object -- dragging, resizing,
+// rotating and curve changes mutate the layer's own left/top/width/height/
+// curve/rotationDeg in place, so the change persists for the rest of the
+// session. Nothing here ever flattens or removes the overlay; the only
+// thing that ever changes its visibility is showTab() hiding layers that
+// belong to the other side.
+function mountPersistentLayer(layer) {
+  const shapeControlsEnabled = layer.kind === "name";
 
-  const containerWidth = imageWrap.clientWidth;
-  const containerHeight = imageWrap.clientHeight;
-
-  // Curve/rotate controls are only offered for the name right now (that's
-  // what was asked for) -- they default to 0 either way, which renders
-  // identically to plain straight-line text.
-  const shapeControlsEnabled = kind === "name";
-  let curve = 0, rotationDeg = 0;
-  const fontFamily = fontOpt ? fontOpt.family : undefined;
-  const fontWeight = fontOpt ? fontOpt.weight : undefined;
-
-  // Always a <div> for the positioned/draggable/resizable box -- <img> can't
-  // render child nodes (like the resize handle), so the logo image goes
-  // INSIDE this div rather than the div itself being the <img>. Text is
-  // drawn into an inner <canvas> (via drawStyledText) rather than set as
-  // plain textContent, so the live preview can show the same curve
-  // rendering that gets baked into the final image.
   const overlay = document.createElement("div");
-  overlay.className = type === "image" ? "drag-overlay-logo" : "drag-overlay-text";
+  overlay.className = layer.type === "image" ? "drag-overlay-logo" : "drag-overlay-text";
+  overlay.dataset.layerId = String(layer.id);
+  layer.overlay = overlay;
+
   let previewCanvas = null;
-  if (type === "image") {
+  if (layer.type === "image") {
     const innerImg = document.createElement("img");
-    innerImg.src = content;
+    innerImg.src = layer.content;
     innerImg.style.width = "100%";
     innerImg.style.height = "100%";
     innerImg.style.display = "block";
@@ -465,50 +509,48 @@ function mountDraggablePlacement({ kind, type, content, onConfirm, onCancel, fon
     overlay.appendChild(previewCanvas);
   }
 
-  // The box itself grows/shrinks taller as the curve increases (the
-  // "sagitta" of the arc) so the visible outline always fits the actual
-  // curved shape, instead of staying a flat rectangle the text spills out
-  // of. Width doesn't need to change -- the arc math keeps the two end
-  // letters at the same horizontal span as the flat layout.
   function redrawTextPreview(effectiveHeight) {
     if (!previewCanvas) return;
     const ch = Math.max(1, Math.round(effectiveHeight));
-    previewCanvas.width = Math.max(1, Math.round(width));
+    previewCanvas.width = Math.max(1, Math.round(layer.width));
     previewCanvas.height = ch;
     const pctx = previewCanvas.getContext("2d");
     pctx.clearRect(0, 0, previewCanvas.width, ch);
-    const boxY = (ch - height) / 2;
-    drawCurveGuide(pctx, { x: 0, y: boxY, width: previewCanvas.width, height, curve });
-    drawStyledText(pctx, content, { x: 0, y: boxY, width: previewCanvas.width, height, curve, fontFamily, fontWeight });
+    const boxY = (ch - layer.height) / 2;
+    drawCurveGuide(pctx, { x: 0, y: boxY, width: previewCanvas.width, height: layer.height, curve: layer.curve });
+    drawStyledText(pctx, layer.content, { x: 0, y: boxY, width: previewCanvas.width, height: layer.height, curve: layer.curve, fontFamily: layer.fontFamily, fontWeight: layer.fontWeight });
   }
 
-  const minSize = type === "image" ? 24 : 16;
-  const maxSize = type === "image" ? 220 : 110;
-  let height = defaults.size;
-  let width = type === "image" ? defaults.size : Math.min(containerWidth * 0.9, measureTextWidth(content, fontFamily, fontWeight, defaults.size) + 16);
-  let left = containerWidth * defaults.leftPct - width / 2;
-  let top = containerHeight * defaults.topPct - height / 2;
+  const minSize = layer.type === "image" ? 24 : 16;
+  const maxSize = layer.type === "image" ? 220 : 110;
 
   function setSize(newHeight) {
-    height = Math.max(minSize, Math.min(maxSize, newHeight));
-    width = type === "image" ? height : Math.min(containerWidth * 0.9, measureTextWidth(content, fontFamily, fontWeight, height) + 16);
+    layer.height = Math.max(minSize, Math.min(maxSize, newHeight));
+    layer.width = layer.type === "image"
+      ? layer.height
+      : Math.min(imageWrap.clientWidth * 0.9, measureTextWidth(layer.content, layer.fontFamily, layer.fontWeight, layer.height) + 16);
   }
   function clamp() {
-    left = Math.max(0, Math.min(containerWidth - width, left));
-    top = Math.max(0, Math.min(containerHeight - height, top));
+    const containerWidth = imageWrap.clientWidth;
+    const containerHeight = imageWrap.clientHeight;
+    layer.left = Math.max(0, Math.min(containerWidth - layer.width, layer.left));
+    layer.top = Math.max(0, Math.min(containerHeight - layer.height, layer.top));
   }
   function applyStyle() {
     clamp();
-    const sagitta = type === "image" ? 0 : curveGeometry(curve, width).sagitta;
-    const effectiveHeight = height + sagitta;
-    overlay.style.left = `${left}px`;
-    overlay.style.top = `${top - sagitta / 2}px`;
-    overlay.style.width = `${width}px`;
+    const sagitta = layer.type === "image" ? 0 : curveGeometry(layer.curve, layer.width).sagitta;
+    const effectiveHeight = layer.height + sagitta;
+    overlay.style.left = `${layer.left}px`;
+    overlay.style.top = `${layer.top - sagitta / 2}px`;
+    overlay.style.width = `${layer.width}px`;
     overlay.style.height = `${effectiveHeight}px`;
-    overlay.style.transform = rotationDeg ? `rotate(${rotationDeg}deg)` : "";
-    if (type !== "image") redrawTextPreview(effectiveHeight);
+    overlay.style.transform = layer.rotationDeg ? `rotate(${layer.rotationDeg}deg)` : "";
+    if (layer.type !== "image") redrawTextPreview(effectiveHeight);
   }
+  layer.applyStyle = applyStyle; // exposed so the curve slider can trigger a redraw
+
   applyStyle();
+  overlay.style.display = layer.view === activeTab ? "" : "none";
   imageWrap.appendChild(overlay);
 
   const handle = document.createElement("div");
@@ -530,14 +572,14 @@ function mountDraggablePlacement({ kind, type, content, onConfirm, onCancel, fon
     dragging = true;
     startX = e.clientX;
     startY = e.clientY;
-    startLeft = left;
-    startTop = top;
+    startLeft = layer.left;
+    startTop = layer.top;
     try { overlay.setPointerCapture(e.pointerId); } catch (err) { /* fine without capture too */ }
   });
   overlay.addEventListener("pointermove", (e) => {
     if (!dragging) return;
-    left = startLeft + (e.clientX - startX);
-    top = startTop + (e.clientY - startY);
+    layer.left = startLeft + (e.clientX - startX);
+    layer.top = startTop + (e.clientY - startY);
     applyStyle();
   });
   overlay.addEventListener("pointerup", () => { dragging = false; });
@@ -549,7 +591,7 @@ function mountDraggablePlacement({ kind, type, content, onConfirm, onCancel, fon
     resizing = true;
     resizeStartX = e.clientX;
     resizeStartY = e.clientY;
-    resizeStartHeight = height;
+    resizeStartHeight = layer.height;
     try { handle.setPointerCapture(e.pointerId); } catch (err) { /* fine without capture too */ }
   });
   handle.addEventListener("pointermove", (e) => {
@@ -560,7 +602,7 @@ function mountDraggablePlacement({ kind, type, content, onConfirm, onCancel, fon
     // itself is angled.
     const rawDx = e.clientX - resizeStartX;
     const rawDy = e.clientY - resizeStartY;
-    const rad = (-rotationDeg * Math.PI) / 180;
+    const rad = (-layer.rotationDeg * Math.PI) / 180;
     const dx = rawDx * Math.cos(rad) - rawDy * Math.sin(rad);
     const dy = rawDx * Math.sin(rad) + rawDy * Math.cos(rad);
     setSize(resizeStartHeight + (dx + dy) / 2);
@@ -583,90 +625,12 @@ function mountDraggablePlacement({ kind, type, content, onConfirm, onCancel, fon
       const cx = rect.left + rect.width / 2;
       const cy = rect.top + rect.height / 2;
       const angle = (Math.atan2(e.clientY - cy, e.clientX - cx) * 180) / Math.PI;
-      rotationDeg = Math.round(angle + 90);
-      overlay.style.transform = `rotate(${rotationDeg}deg)`;
+      layer.rotationDeg = Math.round(angle + 90);
+      overlay.style.transform = `rotate(${layer.rotationDeg}deg)`;
     });
     rotateHandle.addEventListener("pointerup", (e) => { e.stopPropagation(); rotating = false; });
     rotateHandle.addEventListener("pointercancel", (e) => { e.stopPropagation(); rotating = false; });
   }
-
-  function cleanup() {
-    overlay.remove();
-  }
-
-  mountWidget((wrap) => {
-    wrap.innerHTML = `<div class="hint" style="margin:0;">Drag to move, drag the corner handle to resize${shapeControlsEnabled ? ", drag the round handle above it to rotate" : ""}. Switch Front/Back above if you want it on the other side.</div>`;
-
-    if (shapeControlsEnabled) {
-      const shapeRow = document.createElement("div");
-      shapeRow.className = "field-row";
-
-      const curveField = document.createElement("div");
-      curveField.className = "field";
-      const curveLabel = document.createElement("label");
-      curveLabel.textContent = "Curve";
-      const curveInput = document.createElement("input");
-      curveInput.type = "range";
-      curveInput.min = "-100";
-      curveInput.max = "100";
-      curveInput.value = "0";
-      curveInput.addEventListener("input", () => {
-        curve = Number(curveInput.value);
-        applyStyle();
-      });
-      curveField.appendChild(curveLabel);
-      curveField.appendChild(curveInput);
-
-      shapeRow.appendChild(curveField);
-      wrap.appendChild(shapeRow);
-
-      const resetBtn = document.createElement("button");
-      resetBtn.type = "button";
-      resetBtn.className = "chip-btn";
-      resetBtn.textContent = "Reset shape";
-      resetBtn.addEventListener("click", () => {
-        curve = 0; rotationDeg = 0;
-        curveInput.value = "0";
-        applyStyle();
-      });
-      wrap.appendChild(resetBtn);
-    }
-
-    const btnRow = document.createElement("div");
-    btnRow.className = "chip-row";
-    const skipBtn = document.createElement("button");
-    skipBtn.className = "chip-btn";
-    skipBtn.textContent = "Cancel";
-    skipBtn.addEventListener("click", () => { cleanup(); wrap.remove(); addMessage("Cancel", "user"); onCancel(); });
-    const confirmBtn = document.createElement("button");
-    confirmBtn.className = "btn-primary";
-    confirmBtn.textContent = `Confirm ${kind} position`;
-    confirmBtn.addEventListener("click", async () => {
-      confirmBtn.disabled = true;
-      confirmBtn.textContent = "Placing…";
-      const targetView = activeTab; // whichever tab is showing right now
-      try {
-        const newDataUrl = await flattenOverlayToImage(
-          state.images[targetView], type, content, left, top, width, height, containerWidth, containerHeight,
-          { curve, rotationDeg, fontFamily, fontWeight }
-        );
-        state.images[targetView] = newDataUrl;
-        cleanup();
-        showTab(targetView);
-        wrap.remove();
-        addMessage(`Positioned ${kind} (${targetView === "modelBack" ? "back" : "front"})`, "user");
-        pushHistory(`Added ${kind}`);
-        onConfirm();
-      } catch (err) {
-        confirmBtn.disabled = false;
-        confirmBtn.textContent = `Confirm ${kind} position`;
-        addMessage(`Couldn't place the ${kind} (${err.message || err}). Try dragging again.`, "bot");
-      }
-    });
-    btnRow.appendChild(skipBtn);
-    btnRow.appendChild(confirmBtn);
-    wrap.appendChild(btnRow);
-  });
 }
 
 // ---------- Chat engine ----------
@@ -927,6 +891,39 @@ function offerTweakOrContinue() {
   ]);
 }
 
+let layerIdCounter = 0;
+
+// Creates a layer, mounts it as a permanently-draggable overlay, and shows
+// a one-time "Continue" prompt to move the conversation on -- the layer
+// itself is never removed or flattened, so the customer can come back and
+// drag/resize/rotate it again at any later point in the session.
+function createLayer({ kind, view, type, content, size, fontFamily, fontWeight }) {
+  const defaults = DEFAULT_PLACEMENTS[kind];
+  const containerWidth = imageWrap.clientWidth;
+  const containerHeight = imageWrap.clientHeight;
+  const height = size || defaults.size;
+  const width = type === "image" ? height : Math.min(containerWidth * 0.9, measureTextWidth(content, fontFamily, fontWeight, height) + 16);
+  const layer = {
+    id: ++layerIdCounter,
+    kind,
+    view: view || defaults.view,
+    type,
+    content,
+    left: containerWidth * defaults.leftPct - width / 2,
+    top: containerHeight * defaults.topPct - height / 2,
+    width,
+    height,
+    curve: 0,
+    rotationDeg: 0,
+    fontFamily,
+    fontWeight,
+  };
+  state.layers.push(layer);
+  showTab(layer.view);
+  mountPersistentLayer(layer);
+  return layer;
+}
+
 // Places the SAME content (logo file / name text / number text) once, then
 // asks if it should go anywhere else too (e.g. the other side) before
 // moving on -- so the same logo/name/number can end up on both front and
@@ -935,7 +932,7 @@ function askLogo() {
   addMessage("Want a logo added? Upload the file, or skip if you don't need one.", "bot");
   composerUploadOnly("Upload logo", () => { state.logo.wanted = false; askName(); }, (dataUrl) => {
     state.logo = { wanted: true, placement: "positioned by drag", dataUrl };
-    placeLogoOnce(dataUrl);
+    createLogoLayer(dataUrl);
   });
 }
 
@@ -943,23 +940,20 @@ function askLogo() {
 // a second logo/name/number is usually DIFFERENT (e.g. a sponsor logo on
 // the back, a different name for a different spot), not the same one
 // just repositioned.
-function placeLogoOnce(dataUrl) {
-  addMessage("Position the logo: drag it into place, switch Front/Back if needed, resize with the corner handle, then confirm.", "bot");
-  mountDraggablePlacement({
-    kind: "logo",
-    type: "image",
-    content: dataUrl,
-    onConfirm: () => {
-      addMessage("Do you want to upload another logo?", "bot");
-      composerChips([
-        { label: "Yes", onClick: () => {
-          composerUploadOnly("Upload logo", askName, (newDataUrl) => placeLogoOnce(newDataUrl));
-        } },
-        { label: "No, that's it", onClick: askName },
-      ]);
-    },
-    onCancel: askName,
-  });
+function createLogoLayer(dataUrl) {
+  const layer = createLayer({ kind: "logo", type: "image", content: dataUrl });
+  placingLayer = layer;
+  addMessage("Drag it into place, resize with the corner handle, and switch Front/Back if you want it on the other side. You can always come back and move it again later.", "bot");
+  composerChips([{ label: "Continue", onClick: () => {
+    placingLayer = null;
+    addMessage("Do you want to upload another logo?", "bot");
+    composerChips([
+      { label: "Yes", onClick: () => {
+        composerUploadOnly("Upload logo", askName, (newDataUrl) => createLogoLayer(newDataUrl));
+      } },
+      { label: "No, that's it", onClick: askName },
+    ]);
+  } }]);
 }
 
 function askName() {
@@ -967,7 +961,7 @@ function askName() {
   composerTextOnly("e.g. EAGLES", () => { state.name.wanted = false; askNumber(); }, (text) => {
     askNameFont(text, (fontOpt) => {
       state.name = { wanted: true, text, placement: "positioned by drag", font: fontOpt };
-      placeNameOnce(text, fontOpt);
+      createNameLayer(text, fontOpt);
     });
   });
 }
@@ -1009,25 +1003,65 @@ async function askNameFont(text, onDone) {
 // Same reasoning as logo: re-asks for fresh text on "yes" (could be a
 // different name for a different spot) rather than assuming a repeat of
 // the same text.
-function placeNameOnce(text, fontOpt) {
-  addMessage("Position the name: drag it into place, switch Front/Back if needed, resize with the corner handle, then confirm.", "bot");
-  mountDraggablePlacement({
-    kind: "name",
-    type: "text",
-    content: text,
-    fontOpt,
-    onConfirm: () => {
+function createNameLayer(text, fontOpt) {
+  const layer = createLayer({ kind: "name", type: "text", content: text, fontFamily: fontOpt.family, fontWeight: fontOpt.weight });
+  placingLayer = layer;
+  addMessage("Drag it into place, resize with the corner handle, drag the round handle above it to rotate, and switch Front/Back if you want it elsewhere. You can always come back and adjust it later.", "bot");
+
+  mountWidget((wrap) => {
+    const shapeRow = document.createElement("div");
+    shapeRow.className = "field-row";
+    const curveField = document.createElement("div");
+    curveField.className = "field";
+    const curveLabel = document.createElement("label");
+    curveLabel.textContent = "Curve";
+    const curveInput = document.createElement("input");
+    curveInput.type = "range";
+    curveInput.min = "-100";
+    curveInput.max = "100";
+    curveInput.value = "0";
+    curveInput.addEventListener("input", () => {
+      layer.curve = Number(curveInput.value);
+      layer.applyStyle();
+    });
+    curveField.appendChild(curveLabel);
+    curveField.appendChild(curveInput);
+    shapeRow.appendChild(curveField);
+    wrap.appendChild(shapeRow);
+
+    const resetBtn = document.createElement("button");
+    resetBtn.type = "button";
+    resetBtn.className = "chip-btn";
+    resetBtn.textContent = "Reset shape";
+    resetBtn.addEventListener("click", () => {
+      layer.curve = 0;
+      layer.rotationDeg = 0;
+      curveInput.value = "0";
+      layer.applyStyle();
+    });
+    wrap.appendChild(resetBtn);
+
+    const btnRow = document.createElement("div");
+    btnRow.className = "chip-row";
+    const continueBtn = document.createElement("button");
+    continueBtn.className = "btn-primary";
+    continueBtn.textContent = "Continue";
+    continueBtn.addEventListener("click", () => {
+      wrap.remove();
+      addMessage("Continue", "user");
+      placingLayer = null;
       addMessage("Do you want to add another name?", "bot");
       composerChips([
         { label: "Yes", onClick: () => {
           composerTextOnly("e.g. EAGLES", askNumber, (newText) => {
-            askNameFont(newText, (newFontOpt) => placeNameOnce(newText, newFontOpt));
+            askNameFont(newText, (newFontOpt) => createNameLayer(newText, newFontOpt));
           });
         } },
         { label: "No, that's it", onClick: askNumber },
       ]);
-    },
-    onCancel: askNumber,
+    });
+    btnRow.appendChild(continueBtn);
+    wrap.appendChild(btnRow);
   });
 }
 
@@ -1035,28 +1069,27 @@ function askNumber() {
   addMessage("Want a number added? Tell me the number — or skip.", "bot");
   composerTextOnly("e.g. 9", () => { state.number.wanted = false; askOtherGarments(); }, (text) => {
     state.number = { wanted: true, text, placement: "positioned by drag" };
-    placeNumberOnce(text);
+    createNumberLayer(text);
   });
 }
 
-function placeNumberOnce(text) {
-  addMessage("Position the number: drag it into place, switch Front/Back if needed, resize with the corner handle, then confirm.", "bot");
-  mountDraggablePlacement({
-    kind: "number",
-    type: "text",
-    content: text,
-    fontOpt: state.name.font,
-    onConfirm: () => {
-      addMessage("Do you want to add another number?", "bot");
-      composerChips([
-        { label: "Yes", onClick: () => {
-          composerTextOnly("e.g. 9", askOtherGarments, (newText) => placeNumberOnce(newText));
-        } },
-        { label: "No, that's it", onClick: askOtherGarments },
-      ]);
-    },
-    onCancel: askOtherGarments,
-  });
+function createNumberLayer(text) {
+  // Matches whatever font was picked for the name, so the two agree on the
+  // finished garment instead of the number defaulting to plain Arial.
+  const fontOpt = state.name.font || FONT_OPTIONS[0];
+  const layer = createLayer({ kind: "number", type: "text", content: text, fontFamily: fontOpt.family, fontWeight: fontOpt.weight });
+  placingLayer = layer;
+  addMessage("Drag it into place, resize with the corner handle, and switch Front/Back if you want it elsewhere. You can always come back and move it again later.", "bot");
+  composerChips([{ label: "Continue", onClick: () => {
+    placingLayer = null;
+    addMessage("Do you want to add another number?", "bot");
+    composerChips([
+      { label: "Yes", onClick: () => {
+        composerTextOnly("e.g. 9", askOtherGarments, (newText) => createNumberLayer(newText));
+      } },
+      { label: "No, that's it", onClick: askOtherGarments },
+    ]);
+  } }]);
 }
 
 function askOtherGarments() {
@@ -1086,9 +1119,12 @@ function finalReviewCheck() {
   ]);
 }
 
+// Edits the CLEAN base photo -- logo/name/number are never baked into it,
+// they're separate layers recomposited fresh on top afterward, so there's
+// nothing here for the AI to accidentally preserve or disturb.
 async function applyFinalTweak(tweakText, onDone) {
   setLoading("Applying your changes…");
-  const buildPrompt = () => `Modify this exact garment based on this request: "${tweakText}". Keep everything else exactly the same, including any logo, name, or number already shown. ${COLOR_LOCK_RULE} ${FRAMING_RULE} ${NO_TRADEMARKS_RULE}`;
+  const buildPrompt = () => `Modify this exact garment based on this request: "${tweakText}". ${COLOR_LOCK_RULE} ${FRAMING_RULE} ${NO_TRADEMARKS_RULE}`;
   try {
     state.images.modelFront = await editImage([state.images.modelFront], buildPrompt());
     showTab("modelFront");
@@ -1109,13 +1145,17 @@ async function applyFinalTweak(tweakText, onDone) {
 // each item being re-imagined independently. Each one gets its own tab in
 // the main preview -- so everything (hero front/back + every extra
 // garment) lives on the one preview pane, not scattered through the chat.
+// The reference is the COMPOSITED front (base + logo/name/number layers as
+// currently positioned), not the clean base, so the AI can see and
+// replicate whatever branding is actually on the hero shot right now.
 async function generateExtraGarments(names) {
+  const heroReference = await compositeView("modelFront");
   for (const name of names) {
     addMessage(`Generating ${name}…`, "bot");
     setLoading(`Generating ${name}…`);
     try {
       const prompt = `Generate a professional product photograph of a single ${name} ONLY -- not a combination or set with any other garment. Replicate the reference garment's pattern EXACTLY: same stripe/pattern layout, same stripe widths, same colours, same logo, in the same positions relative to the garment. Do not invent, add, or embellish with any new graphic elements, shapes, or decorations that are not present in the reference -- this must look like the same design family manufactured as a ${name}, nothing more, nothing less. ${COLOR_LOCK_RULE} ${FRAMING_RULE} ${NO_TRADEMARKS_RULE} Show only the ${name} by itself, full item visible, plain studio background.`;
-      const img = await editImage([state.images.modelFront], prompt);
+      const img = await editImage([heroReference], prompt);
       const label = name[0].toUpperCase() + name.slice(1);
       let key = `extra_${name.toLowerCase().replace(/[^a-z0-9]+/g, "_")}`;
       if (state.images[key]) key += `_${state.extraGarments.length}`; // avoid collisions on repeated/similar names
@@ -1175,7 +1215,7 @@ function renderImageFigure(container, src, label) {
   container.appendChild(fig);
 }
 
-function onFinalAction(actionType) {
+async function onFinalAction(actionType) {
   const isQuote = actionType === "quote";
   document.getElementById("modal-title").textContent = isQuote
     ? "Thanks — your design request is in!"
@@ -1185,8 +1225,14 @@ function onFinalAction(actionType) {
     : `Nothing was actually sent (this is a prototype). In the live version, a copy of this design would be emailed to <strong>${state.contactEmail || "your email"}</strong> right now.`;
   quoteJson.textContent = JSON.stringify(buildSpec(actionType), null, 2);
   quoteImages.innerHTML = "";
-  renderImageFigure(quoteImages, state.images.modelFront, "Model — Front");
-  renderImageFigure(quoteImages, state.images.modelBack, "Model — Back");
+  // Composited (base + current logo/name/number layer positions) -- these
+  // are what actually gets attached, not the clean untouched base photo.
+  const [frontComposite, backComposite] = await Promise.all([
+    compositeView("modelFront"),
+    compositeView("modelBack"),
+  ]);
+  renderImageFigure(quoteImages, frontComposite, "Model — Front");
+  renderImageFigure(quoteImages, backComposite, "Model — Back");
   state.extraGarments.forEach((g) => renderImageFigure(quoteImages, g.image, g.name[0].toUpperCase() + g.name.slice(1)));
   quoteModal.classList.remove("hidden");
 }
