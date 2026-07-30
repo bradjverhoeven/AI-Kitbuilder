@@ -313,7 +313,6 @@ function drawStyledText(ctx, text, { x, y, width, height, curve = 0, color = "#f
 
   const fontSize = height;
   ctx.font = `${fontWeight} ${fontSize}px ${fontFamily}`;
-  ctx.textBaseline = "middle";
   ctx.textAlign = "center";
   ctx.lineJoin = "round";
   ctx.lineWidth = Math.max(2, fontSize * 0.08);
@@ -335,6 +334,7 @@ function drawStyledText(ctx, text, { x, y, width, height, curve = 0, color = "#f
 
   const c = Math.max(-1, Math.min(1, curve / 100));
   if (c === 0) {
+    ctx.textBaseline = "middle";
     let cursor = cx - totalWidth / 2;
     chars.forEach((ch, i) => {
       drawChar(ch, cursor + widths[i] / 2, cy, 0);
@@ -349,6 +349,9 @@ function drawStyledText(ctx, text, { x, y, width, height, curve = 0, color = "#f
   // where it would sit in the flat layout, converted to an angle) rather
   // than an equal angle slot per character -- otherwise wider/narrower
   // letters end up unevenly spaced or overlapping along the curve.
+  // Baseline (not middle) sits on the curve line, so letters stand on top
+  // of it like text on a path, rather than straddling the line.
+  ctx.textBaseline = "alphabetic";
   const { radius, totalAngle, curveSign } = curveGeometry(curve, totalWidth);
   const halfAngle = Math.abs(totalAngle) / 2;
 
@@ -1042,6 +1045,7 @@ function placeNumberOnce(text) {
     kind: "number",
     type: "text",
     content: text,
+    fontOpt: state.name.font,
     onConfirm: () => {
       addMessage("Do you want to add another number?", "bot");
       composerChips([
