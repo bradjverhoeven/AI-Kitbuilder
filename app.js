@@ -26,6 +26,9 @@ const state = {
   number: { wanted: false, text: "", placement: "" },
   contactName: "",
   contactEmail: "",
+  clubName: "",
+  contactPhone: "",
+  extraGarments: [], // [{ name, image }] — same design applied to other garment types
   history: [], // [{ id, label, front, back }] — every version generated, for click-to-revert
 };
 let historyIdCounter = 0;
@@ -238,7 +241,10 @@ const DEFAULT_PLACEMENTS = {
 function mountDraggablePlacement({ kind, type, content, onConfirm, onCancel }) {
   const defaults = DEFAULT_PLACEMENTS[kind];
   showTab(defaults.view);
-  els.tabs.forEach((b) => { b.disabled = true; });
+  // Tabs stay enabled on purpose -- the customer can switch Front/Back
+  // while positioning (e.g. to put the same logo on both sides across
+  // repeat placements). Whichever tab is active at "Confirm" time is the
+  // one the overlay gets flattened onto (read via `activeTab`).
 
   const containerWidth = imageWrap.clientWidth;
   const containerHeight = imageWrap.clientHeight;
@@ -330,11 +336,10 @@ function mountDraggablePlacement({ kind, type, content, onConfirm, onCancel }) {
 
   function cleanup() {
     overlay.remove();
-    els.tabs.forEach((b) => { b.disabled = false; });
   }
 
   mountWidget((wrap) => {
-    wrap.innerHTML = `<div class="hint" style="margin:0;">Drag to move, drag the corner handle to resize.</div>`;
+    wrap.innerHTML = `<div class="hint" style="margin:0;">Drag to move, drag the corner handle to resize. Switch Front/Back above if you want it on the other side.</div>`;
 
     const btnRow = document.createElement("div");
     btnRow.className = "chip-row";
@@ -348,15 +353,16 @@ function mountDraggablePlacement({ kind, type, content, onConfirm, onCancel }) {
     confirmBtn.addEventListener("click", async () => {
       confirmBtn.disabled = true;
       confirmBtn.textContent = "Placing…";
+      const targetView = activeTab; // whichever tab is showing right now
       try {
         const newDataUrl = await flattenOverlayToImage(
-          state.images[defaults.view], type, content, left, top, width, height, containerWidth, containerHeight
+          state.images[targetView], type, content, left, top, width, height, containerWidth, containerHeight
         );
-        state.images[defaults.view] = newDataUrl;
+        state.images[targetView] = newDataUrl;
         cleanup();
-        showTab(defaults.view);
+        showTab(targetView);
         wrap.remove();
-        addMessage(`Positioned ${kind}`, "user");
+        addMessage(`Positioned ${kind} (${targetView === "modelBack" ? "back" : "front"})`, "user");
         pushHistory(`Added ${kind}`);
         onConfirm();
       } catch (err) {
@@ -405,7 +411,7 @@ function composerText(placeholder, onSubmit) {
     input.placeholder = placeholder;
     const btn = document.createElement("button");
     btn.className = "btn-primary";
-    btn.textContent = "Send";
+    btn.textContent = "Continue";
     const submit = () => {
       const val = input.value.trim();
       if (!val) return;
@@ -488,7 +494,7 @@ function composerTextOnly(placeholder, onSkip, onSubmit) {
     skipBtn.addEventListener("click", () => { wrap.remove(); addMessage("Skip", "user"); onSkip(); });
     const btn = document.createElement("button");
     btn.className = "btn-primary";
-    btn.textContent = "Send";
+    btn.textContent = "Continue";
     const submit = () => {
       const val = input.value.trim();
       if (!val) return;
@@ -509,8 +515,10 @@ function composerTextOnly(placeholder, onSkip, onSubmit) {
 function composerContactForm(onDone) {
   mountWidget((wrap) => {
     wrap.innerHTML = `
+      <div class="field"><label>Club name</label><input type="text" id="c-club" placeholder="e.g. Eastside Hockey Club" /></div>
       <div class="field"><label>Your name</label><input type="text" id="c-name" placeholder="e.g. Francine Miller" /></div>
       <div class="field"><label>Your email</label><input type="email" id="c-email" placeholder="you@example.com" /></div>
+      <div class="field"><label>Your phone number</label><input type="tel" id="c-phone" placeholder="e.g. 021 234 5678" /></div>
     `;
     const btnRow = document.createElement("div");
     btnRow.className = "chip-row";
@@ -518,10 +526,12 @@ function composerContactForm(onDone) {
     btn.className = "btn-primary";
     btn.textContent = "Continue";
     btn.addEventListener("click", () => {
+      state.clubName = wrap.querySelector("#c-club").value.trim();
       state.contactName = wrap.querySelector("#c-name").value.trim();
       state.contactEmail = wrap.querySelector("#c-email").value.trim();
+      state.contactPhone = wrap.querySelector("#c-phone").value.trim();
       wrap.remove();
-      addMessage(`${state.contactName} — ${state.contactEmail}`, "user");
+      addMessage(`${state.clubName} — ${state.contactName} — ${state.contactEmail} — ${state.contactPhone}`, "user");
       onDone();
     });
     btnRow.appendChild(btn);
@@ -531,11 +541,19 @@ function composerContactForm(onDone) {
 
 function composerReview() {
   mountWidget((wrap) => {
-    const btn = document.createElement("button");
-    btn.className = "btn-primary";
-    btn.textContent = "Request a Quote";
-    btn.addEventListener("click", () => { wrap.remove(); onRequestQuote(); });
-    wrap.appendChild(btn);
+    const row = document.createElement("div");
+    row.className = "chip-row";
+    const quoteBtn = document.createElement("button");
+    quoteBtn.className = "btn-primary";
+    quoteBtn.textContent = "Request a Quote";
+    quoteBtn.addEventListener("click", () => { wrap.remove(); onFinalAction("quote"); });
+    const emailBtn = document.createElement("button");
+    emailBtn.className = "btn-secondary";
+    emailBtn.textContent = "Email Design";
+    emailBtn.addEventListener("click", () => { wrap.remove(); onFinalAction("email"); });
+    row.appendChild(quoteBtn);
+    row.appendChild(emailBtn);
+    wrap.appendChild(row);
   });
 }
 
@@ -616,46 +634,95 @@ function offerTweakOrContinue() {
   ]);
 }
 
+// Places the SAME content (logo file / name text / number text) once, then
+// asks if it should go anywhere else too (e.g. the other side) before
+// moving on -- so the same logo/name/number can end up on both front and
+// back without re-uploading or re-typing it.
+function placementLoop(kind, type, content, onDone) {
+  function placeOnce() {
+    addMessage(`Position the ${kind}: drag it into place, switch Front/Back if needed, resize with the corner handle, then confirm.`, "bot");
+    mountDraggablePlacement({
+      kind,
+      type,
+      content,
+      onConfirm: () => {
+        addMessage(`Add this ${kind} anywhere else too (e.g. the other side)?`, "bot");
+        composerChips([
+          { label: "Yes, add another", onClick: placeOnce },
+          { label: "No, that's it", onClick: onDone },
+        ]);
+      },
+      onCancel: onDone,
+    });
+  }
+  placeOnce();
+}
+
 function askLogo() {
   addMessage("Want a logo added? Upload the file, or skip if you don't need one.", "bot");
   composerUploadOnly("Upload logo", () => { state.logo.wanted = false; askName(); }, (dataUrl) => {
-    addMessage("Drag the logo to where you'd like it, resize if needed, then confirm.", "bot");
-    mountDraggablePlacement({
-      kind: "logo",
-      type: "image",
-      content: dataUrl,
-      onConfirm: () => { state.logo = { wanted: true, placement: "positioned by drag", dataUrl }; askName(); },
-      onCancel: () => { state.logo.wanted = false; askName(); },
-    });
+    state.logo = { wanted: true, placement: "positioned by drag", dataUrl };
+    placementLoop("logo", "image", dataUrl, askName);
   });
 }
 
 function askName() {
   addMessage("Want a team or player name added? Tell me what it should say — or skip.", "bot");
   composerTextOnly("e.g. EAGLES", () => { state.name.wanted = false; askNumber(); }, (text) => {
-    addMessage("Drag the name to where you'd like it, resize if needed, then confirm.", "bot");
-    mountDraggablePlacement({
-      kind: "name",
-      type: "text",
-      content: text,
-      onConfirm: () => { state.name = { wanted: true, text, placement: "positioned by drag" }; askNumber(); },
-      onCancel: () => { state.name.wanted = false; askNumber(); },
-    });
+    state.name = { wanted: true, text, placement: "positioned by drag" };
+    placementLoop("name", "text", text, askNumber);
   });
 }
 
 function askNumber() {
   addMessage("Want a number added? Tell me the number — or skip.", "bot");
-  composerTextOnly("e.g. 9", () => { state.number.wanted = false; askContact(); }, (text) => {
-    addMessage("Drag the number to where you'd like it, resize if needed, then confirm.", "bot");
-    mountDraggablePlacement({
-      kind: "number",
-      type: "text",
-      content: text,
-      onConfirm: () => { state.number = { wanted: true, text, placement: "positioned by drag" }; askContact(); },
-      onCancel: () => { state.number.wanted = false; askContact(); },
-    });
+  composerTextOnly("e.g. 9", () => { state.number.wanted = false; askOtherGarments(); }, (text) => {
+    state.number = { wanted: true, text, placement: "positioned by drag" };
+    placementLoop("number", "text", text, askOtherGarments);
   });
+}
+
+function askOtherGarments() {
+  addMessage("Did you want this design on any other garments?", "bot");
+  composerChips([
+    { label: "Yes", onClick: () => {
+      composerText("e.g. shorts, socks, jacket", (val) => {
+        const names = val.split(/[,\n]/).map((s) => s.trim()).filter(Boolean);
+        generateExtraGarments(names);
+      });
+    } },
+    { label: "No", onClick: askContact },
+  ]);
+}
+
+function addImageMessage(dataUrl, caption) {
+  const div = document.createElement("div");
+  div.className = "msg bot";
+  div.innerHTML = `<img src="${dataUrl}" alt="${caption}" style="max-width:220px;border-radius:8px;display:block;margin-bottom:6px;" /><div>${caption}</div>`;
+  chatLog.appendChild(div);
+  chatLog.scrollTop = chatLog.scrollHeight;
+}
+
+// Extra garments reuse the CONFIRMED hero image as a reference (img2img),
+// so the same colours/pattern/logo carry over consistently instead of
+// each item being re-imagined independently.
+async function generateExtraGarments(names) {
+  for (const name of names) {
+    addMessage(`Generating ${name}…`, "bot");
+    setLoading(`Generating ${name}…`);
+    try {
+      const prompt = `Generate a professional product photograph of a ${name}, using the exact same colours, pattern, and design style as the reference garment shown -- same design family, different item. ${COLOR_LOCK_RULE} ${FRAMING_RULE} Show the ${name} by itself, full item visible, plain studio background.`;
+      const img = await editImage([state.images.modelFront], prompt);
+      state.extraGarments.push({ name, image: img });
+      showTab("modelFront");
+      addImageMessage(img, name[0].toUpperCase() + name.slice(1));
+    } catch (err) {
+      showTab("modelFront");
+      addMessage(`Couldn't generate the ${name} (${err.message}).`, "bot");
+    }
+  }
+  addMessage("All done with extra garments.", "bot");
+  askContact();
 }
 
 function askContact() {
@@ -667,19 +734,23 @@ function askContact() {
 }
 
 // ---------- Quote capture ----------
-function buildSpec() {
+function buildSpec(actionType) {
   return {
     submitted_at: "PROTOTYPE — timestamp would be set server-side",
+    action: actionType, // "quote" | "email"
     reseller: RESELLER_CONFIG.name,
-    notify_emails: [RESELLER_CONFIG.notifyEmail, "brad@theprocurementroom.co.nz"],
+    notify_emails: actionType === "quote" ? [RESELLER_CONFIG.notifyEmail, "brad@theprocurementroom.co.nz"] : [state.contactEmail],
+    club_name: state.clubName || null,
     contact_name: state.contactName || null,
     contact_email: state.contactEmail || null,
+    contact_phone: state.contactPhone || null,
     design_description_raw: state.designRaw,
     tweaks_requested: state.tweaks,
     logo: state.logo.wanted ? { placement: state.logo.placement, uploaded: Boolean(state.logo.dataUrl) } : null,
     team_name: state.name.wanted ? { text: state.name.text, placement: state.name.placement } : null,
     back_number: state.number.wanted ? { text: state.number.text, placement: state.number.placement } : null,
-    images_attached: ["model_front", "model_back"],
+    extra_garments: state.extraGarments.map((g) => g.name),
+    images_attached: ["model_front", "model_back", ...state.extraGarments.map((g) => g.name)],
     next_step: "On approval + order placed, this spec + reference images go to production artwork (Stage 4) for true vector redraw — not generated automatically here.",
   };
 }
@@ -695,12 +766,19 @@ function renderImageFigure(container, src, label) {
   container.appendChild(fig);
 }
 
-function onRequestQuote() {
-  document.getElementById("modal-reseller-name").textContent = RESELLER_CONFIG.name;
-  quoteJson.textContent = JSON.stringify(buildSpec(), null, 2);
+function onFinalAction(actionType) {
+  const isQuote = actionType === "quote";
+  document.getElementById("modal-title").textContent = isQuote
+    ? "Thanks — your design request is in!"
+    : "Your design is on its way!";
+  document.getElementById("modal-note").innerHTML = isQuote
+    ? `Nothing was actually sent (this is a prototype). In the live version, <strong>${RESELLER_CONFIG.name}</strong> and our team would be emailed right now with these images attached.`
+    : `Nothing was actually sent (this is a prototype). In the live version, a copy of this design would be emailed to <strong>${state.contactEmail || "your email"}</strong> right now.`;
+  quoteJson.textContent = JSON.stringify(buildSpec(actionType), null, 2);
   quoteImages.innerHTML = "";
   renderImageFigure(quoteImages, state.images.modelFront, "Model — Front");
   renderImageFigure(quoteImages, state.images.modelBack, "Model — Back");
+  state.extraGarments.forEach((g) => renderImageFigure(quoteImages, g.image, g.name[0].toUpperCase() + g.name.slice(1)));
   quoteModal.classList.remove("hidden");
 }
 
