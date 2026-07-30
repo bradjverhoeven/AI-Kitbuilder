@@ -29,7 +29,7 @@ const state = {
 };
 
 // ---------- Prompt building ----------
-const FRAMING_RULE = "Full-length shot: the ENTIRE garment must be visible in frame, from the shoulders/collar all the way down to the hem — never crop off the bottom or any part of the garment.";
+const FRAMING_RULE = "Full-length shot: the ENTIRE garment must be visible in frame, from the shoulders/collar all the way down to the hem - never crop off the bottom or any part of the garment.";
 
 function fullDesignDescription() {
   let desc = state.designRaw;

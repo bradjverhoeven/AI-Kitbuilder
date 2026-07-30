@@ -17,7 +17,26 @@ import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-ENV_PATH = os.path.join(ROOT, ".env")  # local dev only -- on Render, OPENAI_API_KEY comes from its dashboard env var
+ENV_PATH = os.path.join(ROOT, "..", ".env")
+
+# Customers may type/paste smart quotes, em/en-dashes, ellipses etc. (common
+# from phone keyboards and autocorrect). Normalize to plain ASCII equivalents
+# defensively, since some part of this server's HTTP stack hit a 'latin-1'
+# encode error on a non-ASCII em-dash in production.
+_PUNCTUATION_MAP = str.maketrans({
+    "—": "-", "–": "-",  # em dash, en dash
+    "‘": "'", "’": "'",  # curly single quotes
+    "“": '"', "”": '"',  # curly double quotes
+    "…": "...",  # ellipsis
+})
+
+
+def sanitize_text(value):
+    if not isinstance(value, str):
+        return value
+    return value.translate(_PUNCTUATION_MAP)
+
+
 STATIC_FILES = {"/", "/index.html", "/style.css", "/app.js"}
 
 
@@ -138,7 +157,7 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b"{}"
         try:
             payload = json.loads(raw.decode("utf-8"))
-            prompt = (payload.get("prompt") or "").strip()
+            prompt = sanitize_text((payload.get("prompt") or "").strip())
             size = payload.get("size", "1024x1024")
             if not prompt:
                 raise ValueError("prompt is required")
