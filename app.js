@@ -237,18 +237,38 @@ function renderHistory() {
 // hold up.)
 const imageWrap = document.querySelector(".image-wrap");
 
-// Shared arc math: given a curve amount and the flat text width (the
-// chord), returns the circle radius/angle needed so the two end letters
-// still land at the same horizontal span as the flat layout -- and the
-// "sagitta" (how far the curve bulges vertically), which the live preview
-// box uses to grow/shrink to fit as the curve changes.
-function curveGeometry(curveVal, chordWidth) {
+// The placement box's width MUST match the text's real rendered width in
+// its actual font, not a character-count guess -- a mismatch there is
+// what let curved letters spill past the box and get clipped (the box
+// thought the text was narrower than it actually rendered). Same font
+// string drawStyledText uses, so the measurement always matches the draw.
+const _measureCtx = document.createElement("canvas").getContext("2d");
+function measureTextWidth(text, fontFamily, fontWeight, fontSize) {
+  _measureCtx.font = `${fontWeight || "bold"} ${fontSize}px ${fontFamily || "Arial, sans-serif"}`;
+  return _measureCtx.measureText(text).width;
+}
+
+// Shared arc math: given a curve amount and the flat text width, returns
+// the circle radius/angle used to place letters along an arc, plus the
+// "sagitta" (how far the curve bulges vertically) the live preview box
+// uses to grow/shrink to fit as the curve changes.
+//
+// Letters are positioned by walking along the arc by their actual pixel
+// width (arc length), so the radius must satisfy arcLength = radius *
+// angle -- NOT the chord (straight-line endpoint-to-endpoint) formula.
+// Using the chord formula here previously caused a chord/arc-length
+// mismatch that over-rotated every letter, worse the more the text
+// curved (visible as letters tipping almost sideways at moderate curve).
+function curveGeometry(curveVal, textWidth) {
   const c = Math.max(-1, Math.min(1, curveVal / 100));
-  if (c === 0 || !chordWidth) return { radius: 0, totalAngle: 0, sagitta: 0, curveSign: 1 };
-  const maxSpread = (140 * Math.PI) / 180;
+  if (c === 0 || !textWidth) return { radius: 0, totalAngle: 0, sagitta: 0, curveSign: 1 };
+  // Max total sweep kept modest (was 140deg) -- text-on-a-path only looks
+  // "clean" like a badge/logo curve at gentle-to-moderate angles; beyond
+  // that individual letters read as tilted rather than smoothly arced.
+  const maxSpread = (60 * Math.PI) / 180;
   const totalAngle = c * maxSpread;
   const halfAngle = Math.abs(totalAngle) / 2;
-  const radius = halfAngle > 0.001 ? (chordWidth / 2) / Math.sin(halfAngle) : 0;
+  const radius = halfAngle > 0.001 ? textWidth / (2 * halfAngle) : 0;
   const sagitta = radius ? radius * (1 - Math.cos(halfAngle)) : 0;
   return { radius, totalAngle, sagitta, curveSign: c > 0 ? 1 : -1 };
 }
@@ -462,13 +482,13 @@ function mountDraggablePlacement({ kind, type, content, onConfirm, onCancel, fon
   const minSize = type === "image" ? 24 : 16;
   const maxSize = type === "image" ? 220 : 110;
   let height = defaults.size;
-  let width = type === "image" ? defaults.size : Math.min(containerWidth * 0.9, content.length * defaults.size * 0.62 + 16);
+  let width = type === "image" ? defaults.size : Math.min(containerWidth * 0.9, measureTextWidth(content, fontFamily, fontWeight, defaults.size) + 16);
   let left = containerWidth * defaults.leftPct - width / 2;
   let top = containerHeight * defaults.topPct - height / 2;
 
   function setSize(newHeight) {
     height = Math.max(minSize, Math.min(maxSize, newHeight));
-    width = type === "image" ? height : Math.min(containerWidth * 0.9, content.length * height * 0.62 + 16);
+    width = type === "image" ? height : Math.min(containerWidth * 0.9, measureTextWidth(content, fontFamily, fontWeight, height) + 16);
   }
   function clamp() {
     left = Math.max(0, Math.min(containerWidth - width, left));
