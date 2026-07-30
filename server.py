@@ -136,30 +136,6 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/health":
             self._json(200, {"ok": True, "key_configured": bool(OPENAI_API_KEY)})
             return
-        if self.path == "/api/debug-key":
-            # TEMPORARY diagnostic endpoint -- remove once the encoding bug is found.
-            key = OPENAI_API_KEY or ""
-            bad_chars = [
-                {"position": i, "char": repr(c), "codepoint": ord(c)}
-                for i, c in enumerate(key) if ord(c) > 255
-            ]
-            try:
-                ("Bearer " + key).encode("latin-1")
-                encode_ok = True
-                encode_error = None
-            except UnicodeEncodeError as e:
-                encode_ok = False
-                encode_error = str(e)
-            self._json(200, {
-                "length": len(key),
-                "first_15": repr(key[:15]),
-                "last_15": repr(key[-15:]),
-                "bad_chars_above_255": bad_chars[:20],
-                "bad_char_count": len(bad_chars),
-                "bearer_encode_ok": encode_ok,
-                "bearer_encode_error": encode_error,
-            })
-            return
         if self.path in STATIC_FILES:
             filename = "index.html" if self.path == "/" else self.path.lstrip("/")
             filepath = os.path.join(ROOT, filename)
@@ -199,9 +175,8 @@ class Handler(BaseHTTPRequestHandler):
         except urllib.error.HTTPError as e:
             self._json(502, {"error": e.read().decode("utf-8", errors="replace")})
         except Exception as e:
-            tb = traceback.format_exc()
-            print(tb)  # also visible in Render's Logs tab
-            self._json(500, {"error": tb})  # TEMPORARY: full traceback in the response for debugging
+            traceback.print_exc()  # full traceback -> stderr, visible in Render's Logs tab if needed
+            self._json(500, {"error": str(e)})
 
     def log_message(self, format, *args):
         pass
