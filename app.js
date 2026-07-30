@@ -87,9 +87,11 @@ const els = {
   loadingText: document.getElementById("image-loading-text"),
   img: document.getElementById("preview-image"),
   downloadBtn: document.getElementById("download-image-btn"),
-  tabs: document.querySelectorAll("#image-tabs .view-btn"),
+  tabsContainer: document.getElementById("image-tabs"),
 };
 let activeTab = "modelFront";
+
+function getTabs() { return [...els.tabsContainer.querySelectorAll(".view-btn")]; }
 
 function setLoading(text) {
   els.placeholder.style.display = "none";
@@ -101,7 +103,7 @@ function setLoading(text) {
 
 function showTab(tab) {
   activeTab = tab;
-  els.tabs.forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
+  getTabs().forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
   const src = state.images[tab];
   els.loading.style.display = "none";
   if (src) {
@@ -116,16 +118,26 @@ function showTab(tab) {
   }
 }
 
-els.tabs.forEach((btn) => {
-  btn.addEventListener("click", () => {
-    if (btn.disabled) return;
-    showTab(btn.dataset.tab);
-  });
+// Delegated (not per-button) so tabs added later for extra garments work
+// without needing their own listener wired up.
+els.tabsContainer.addEventListener("click", (e) => {
+  const btn = e.target.closest(".view-btn");
+  if (!btn || btn.disabled) return;
+  showTab(btn.dataset.tab);
 });
 
 function enableTab(tab) {
-  const btn = document.querySelector(`#image-tabs .view-btn[data-tab="${tab}"]`);
+  const btn = els.tabsContainer.querySelector(`.view-btn[data-tab="${tab}"]`);
   if (btn) btn.disabled = false;
+}
+
+function addGarmentTab(key, label) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "view-btn";
+  btn.dataset.tab = key;
+  btn.textContent = label;
+  els.tabsContainer.appendChild(btn);
 }
 
 els.downloadBtn.addEventListener("click", () => {
@@ -691,21 +703,47 @@ function askOtherGarments() {
         generateExtraGarments(names);
       });
     } },
+    { label: "No", onClick: finalReviewCheck },
+  ]);
+}
+
+// Final checkpoint once everything (design, logo/name/number, extra
+// garments) is in place. A "yes" here edits front and back INDEPENDENTLY
+// from themselves (not one derived from the other), so whatever's already
+// been placed on each side isn't lost in the process.
+function finalReviewCheck() {
+  addMessage("How's everything looking? Did you want to change anything?", "bot");
+  composerChips([
+    { label: "Yes", onClick: () => {
+      composerText("What would you like to change?", (val) => applyFinalTweak(val, finalReviewCheck));
+    } },
     { label: "No", onClick: askContact },
   ]);
 }
 
-function addImageMessage(dataUrl, caption) {
-  const div = document.createElement("div");
-  div.className = "msg bot";
-  div.innerHTML = `<img src="${dataUrl}" alt="${caption}" style="max-width:220px;border-radius:8px;display:block;margin-bottom:6px;" /><div>${caption}</div>`;
-  chatLog.appendChild(div);
-  chatLog.scrollTop = chatLog.scrollHeight;
+async function applyFinalTweak(tweakText, onDone) {
+  setLoading("Applying your changes…");
+  const buildPrompt = () => `Modify this exact garment based on this request: "${tweakText}". Keep everything else exactly the same, including any logo, name, or number already shown. ${COLOR_LOCK_RULE} ${FRAMING_RULE}`;
+  try {
+    state.images.modelFront = await editImage([state.images.modelFront], buildPrompt());
+    showTab("modelFront");
+    setLoading("Applying your changes to the back…");
+    state.images.modelBack = await editImage([state.images.modelBack], buildPrompt());
+    showTab("modelFront");
+    pushHistory(`Tweak: ${tweakText}`);
+    addMessage("Here's the updated look.", "bot");
+  } catch (err) {
+    showTab("modelFront");
+    addMessage(`Couldn't apply that change (${err.message}). Continuing with what we have.`, "bot");
+  }
+  onDone();
 }
 
 // Extra garments reuse the CONFIRMED hero image as a reference (img2img),
 // so the same colours/pattern/logo carry over consistently instead of
-// each item being re-imagined independently.
+// each item being re-imagined independently. Each one gets its own tab in
+// the main preview -- so everything (hero front/back + every extra
+// garment) lives on the one preview pane, not scattered through the chat.
 async function generateExtraGarments(names) {
   for (const name of names) {
     addMessage(`Generating ${name}…`, "bot");
@@ -713,16 +751,22 @@ async function generateExtraGarments(names) {
     try {
       const prompt = `Generate a professional product photograph of a ${name}, using the exact same colours, pattern, and design style as the reference garment shown -- same design family, different item. ${COLOR_LOCK_RULE} ${FRAMING_RULE} Show the ${name} by itself, full item visible, plain studio background.`;
       const img = await editImage([state.images.modelFront], prompt);
-      state.extraGarments.push({ name, image: img });
-      showTab("modelFront");
-      addImageMessage(img, name[0].toUpperCase() + name.slice(1));
+      const label = name[0].toUpperCase() + name.slice(1);
+      let key = `extra_${name.toLowerCase().replace(/[^a-z0-9]+/g, "_")}`;
+      if (state.images[key]) key += `_${state.extraGarments.length}`; // avoid collisions on repeated/similar names
+      state.images[key] = img;
+      state.extraGarments.push({ name, image: img, key });
+      addGarmentTab(key, label);
+      showTab(key);
+      addMessage(`${label} added — see the tabs above.`, "bot");
     } catch (err) {
       showTab("modelFront");
       addMessage(`Couldn't generate the ${name} (${err.message}).`, "bot");
     }
   }
-  addMessage("All done with extra garments.", "bot");
-  askContact();
+  showTab("modelFront");
+  addMessage("All done with extra garments — every item's viewable in the tabs above.", "bot");
+  finalReviewCheck();
 }
 
 function askContact() {
