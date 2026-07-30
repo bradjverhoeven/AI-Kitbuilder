@@ -175,8 +175,9 @@ class Handler(BaseHTTPRequestHandler):
         except urllib.error.HTTPError as e:
             self._json(502, {"error": e.read().decode("utf-8", errors="replace")})
         except Exception as e:
-            traceback.print_exc()  # full traceback -> stderr, visible in Render's Logs tab
-            self._json(500, {"error": str(e)})
+            tb = traceback.format_exc()
+            print(tb)  # also visible in Render's Logs tab
+            self._json(500, {"error": tb})  # TEMPORARY: full traceback in the response for debugging
 
     def log_message(self, format, *args):
         pass
