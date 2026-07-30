@@ -101,18 +101,8 @@ body {
   opacity: 0.92;
 }
 .drag-overlay-text {
-  font-weight: 800;
-  font-family: Arial, sans-serif;
-  color: #ffffff;
-  -webkit-text-stroke: 1.5px #000;
-  text-shadow: 0 0 3px rgba(0,0,0,0.6);
-  white-space: nowrap;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  text-align: center;
-  border: 1px dashed var(--accent);
-  border-radius: 4px;
+  /* No static border here -- the inner canvas draws its own guide outline,
+     which curves to match the text instead of staying a flat rectangle. */
 }
 
 .resize-handle {
@@ -128,6 +118,29 @@ body {
   touch-action: none;
   z-index: 6;
 }
+
+.rotate-handle {
+  position: absolute;
+  top: -30px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 22px;
+  height: 22px;
+  background: var(--accent);
+  border: 2px solid #fff;
+  border-radius: 50%;
+  cursor: grab;
+  touch-action: none;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  line-height: 1;
+  color: #fff;
+  user-select: none;
+}
+.rotate-handle:active { cursor: grabbing; }
 #preview-image { width: 100%; height: 100%; object-fit: contain; display: block; }
 .image-placeholder {
   padding: 24px;
@@ -315,6 +328,38 @@ body {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+}
+.font-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 8px;
+}
+.font-choice {
+  border: 1px solid var(--line);
+  background: var(--panel);
+  border-radius: 8px;
+  padding: 10px 8px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  overflow: hidden;
+}
+.font-choice:hover { border-color: var(--accent); }
+.font-choice-sample {
+  font-size: 20px;
+  color: var(--ink);
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.font-choice-label {
+  font-size: 10px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
 }
 .chip-btn {
   border: 1px solid var(--line);

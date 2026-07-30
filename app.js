@@ -16,13 +16,42 @@ const RESELLER_CONFIG = {
   notifyEmail: "francine.miller@nzuniforms.com",
 };
 
+// Custom team/name fonts, loaded from local files rather than relying on
+// whatever's installed on the customer's device. "Impact Custom" (not
+// "Impact") so this always renders TPR's exact font file, not a
+// similarly-named system font that may look different on the customer's device.
+const FONT_FILES = [
+  { label: "Gotham Bold", family: "Gotham Bold", file: "gotham-bold.ttf" },
+  { label: "Impact", family: "Impact Custom", file: "impact.ttf" },
+  { label: "Norwester", family: "Norwester", file: "norwester.otf" },
+  { label: "Sablon Up College", family: "Sablon Up College", file: "sablon-up-college.otf" },
+  { label: "Airstrike", family: "Airstrike", file: "airstrike.ttf" },
+];
+const FONT_OPTIONS = [
+  { label: "Classic", family: "Arial, sans-serif", weight: "bold" },
+  ...FONT_FILES.map((f) => ({ label: f.label, family: f.family, weight: "normal" })),
+];
+// Canvas text rendering does NOT wait for @font-face to finish loading --
+// if you draw before it's ready you silently get the fallback font with no
+// error. Loading explicitly via the FontFace API (rather than just a CSS
+// @font-face rule) gives a promise to await before the font picker/preview
+// ever draws with a custom font.
+const fontsReady = Promise.all(
+  FONT_FILES.map((f) =>
+    new FontFace(f.family, `url(fonts/${f.file})`)
+      .load()
+      .then((loaded) => document.fonts.add(loaded))
+      .catch((err) => console.warn(`Font failed to load: ${f.label}`, err))
+  )
+);
+
 const state = {
   designRaw: "",
   tweaks: [],
   tweakCount: 0,
   images: { modelFront: null, modelBack: null, flatFront: null, flatBack: null },
   logo: { wanted: false, placement: "", dataUrl: null },
-  name: { wanted: false, text: "", placement: "" },
+  name: { wanted: false, text: "", placement: "", font: FONT_OPTIONS[0] },
   number: { wanted: false, text: "", placement: "" },
   contactName: "",
   contactEmail: "",
@@ -208,7 +237,114 @@ function renderHistory() {
 // hold up.)
 const imageWrap = document.querySelector(".image-wrap");
 
-function flattenOverlayToImage(baseDataUrl, type, content, left, top, width, height, containerWidth, containerHeight) {
+// Shared arc math: given a curve amount and the flat text width (the
+// chord), returns the circle radius/angle needed so the two end letters
+// still land at the same horizontal span as the flat layout -- and the
+// "sagitta" (how far the curve bulges vertically), which the live preview
+// box uses to grow/shrink to fit as the curve changes.
+function curveGeometry(curveVal, chordWidth) {
+  const c = Math.max(-1, Math.min(1, curveVal / 100));
+  if (c === 0 || !chordWidth) return { radius: 0, totalAngle: 0, sagitta: 0, curveSign: 1 };
+  const maxSpread = (140 * Math.PI) / 180;
+  const totalAngle = c * maxSpread;
+  const halfAngle = Math.abs(totalAngle) / 2;
+  const radius = halfAngle > 0.001 ? (chordWidth / 2) / Math.sin(halfAngle) : 0;
+  const sagitta = radius ? radius * (1 - Math.cos(halfAngle)) : 0;
+  return { radius, totalAngle, sagitta, curveSign: c > 0 ? 1 : -1 };
+}
+
+// Dashed guide shown while dragging: a plain rectangle when flat, or an
+// arc tracing the same curve as the text when curved -- so the guide
+// always reflects the actual shape being placed instead of a static box.
+function drawCurveGuide(ctx, { x, y, width, height, curve = 0 }) {
+  const cx = x + width / 2;
+  const cy = y + height / 2;
+  const { radius, totalAngle, curveSign } = curveGeometry(curve, width);
+  ctx.save();
+  ctx.setLineDash([4, 4]);
+  ctx.strokeStyle = "rgba(200,16,46,0.9)";
+  ctx.lineWidth = 1.5;
+  if (!radius) {
+    ctx.strokeRect(x + 0.5, y + 0.5, Math.max(0, width - 1), Math.max(0, height - 1));
+    ctx.restore();
+    return;
+  }
+  const halfAngle = Math.abs(totalAngle) / 2;
+  const steps = 24;
+  ctx.beginPath();
+  for (let i = 0; i <= steps; i++) {
+    const angle = -halfAngle + (i / steps) * (2 * halfAngle);
+    const px = cx + radius * Math.sin(angle);
+    const py = cy + radius * (Math.cos(angle) - 1) * curveSign;
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Shared by the live drag-preview canvas AND the final flatten-to-image
+// canvas, so what the customer sees while positioning is exactly what
+// gets baked into the final picture.
+function drawStyledText(ctx, text, { x, y, width, height, curve = 0, color = "#fff", strokeColor = "#000", fontFamily = "Arial, sans-serif", fontWeight = "bold" }) {
+  const cx = x + width / 2;
+  const cy = y + height / 2;
+  const n = text.length;
+  if (n === 0) return;
+
+  const fontSize = height;
+  ctx.font = `${fontWeight} ${fontSize}px ${fontFamily}`;
+  ctx.textBaseline = "middle";
+  ctx.textAlign = "center";
+  ctx.lineJoin = "round";
+  ctx.lineWidth = Math.max(2, fontSize * 0.08);
+  ctx.strokeStyle = strokeColor;
+  ctx.fillStyle = color;
+
+  const chars = text.split("");
+  const widths = chars.map((ch) => ctx.measureText(ch).width);
+  const totalWidth = widths.reduce((a, w) => a + w, 0);
+
+  const drawChar = (ch, px, py, angle) => {
+    ctx.save();
+    ctx.translate(px, py);
+    if (angle) ctx.rotate(angle);
+    ctx.strokeText(ch, 0, 0);
+    ctx.fillText(ch, 0, 0);
+    ctx.restore();
+  };
+
+  const c = Math.max(-1, Math.min(1, curve / 100));
+  if (c === 0) {
+    let cursor = cx - totalWidth / 2;
+    chars.forEach((ch, i) => {
+      drawChar(ch, cursor + widths[i] / 2, cy, 0);
+      cursor += widths[i];
+    });
+    return;
+  }
+
+  // Curve (-100..100): letters follow an arc. Positive curves like a
+  // smile (ends lift up); negative curves like a dome (ends dip down).
+  // Each letter is placed by its cumulative arc-length position (i.e.
+  // where it would sit in the flat layout, converted to an angle) rather
+  // than an equal angle slot per character -- otherwise wider/narrower
+  // letters end up unevenly spaced or overlapping along the curve.
+  const { radius, totalAngle, curveSign } = curveGeometry(curve, totalWidth);
+  const halfAngle = Math.abs(totalAngle) / 2;
+
+  let cumulative = 0;
+  chars.forEach((ch, i) => {
+    const center = cumulative + widths[i] / 2;
+    cumulative += widths[i];
+    const t = totalWidth > 0 ? (center / totalWidth) * 2 - 1 : 0; // -1 (start) .. 1 (end)
+    const angle = t * halfAngle;
+    const dx = radius ? radius * Math.sin(angle) : 0;
+    const dy = radius ? radius * (Math.cos(angle) - 1) * curveSign : 0;
+    drawChar(ch, cx + dx, cy + dy, angle * curveSign);
+  });
+}
+
+function flattenOverlayToImage(baseDataUrl, type, content, left, top, width, height, containerWidth, containerHeight, textStyle = {}) {
   return new Promise((resolve, reject) => {
     const baseImg = new Image();
     baseImg.onload = () => {
@@ -234,15 +370,17 @@ function flattenOverlayToImage(baseDataUrl, type, content, left, top, width, hei
         logoImg.onerror = reject;
         logoImg.src = content;
       } else {
-        const fontSize = h;
-        ctx.font = `bold ${fontSize}px Arial, sans-serif`;
-        ctx.textBaseline = "top";
-        ctx.textAlign = "left";
-        ctx.lineWidth = Math.max(2, fontSize * 0.08);
-        ctx.strokeStyle = "black";
-        ctx.fillStyle = "white";
-        ctx.strokeText(content, x, y);
-        ctx.fillText(content, x, y);
+        const { curve = 0, rotationDeg = 0, fontFamily, fontWeight } = textStyle;
+        ctx.save();
+        if (rotationDeg) {
+          const cx = x + w / 2;
+          const cy = y + h / 2;
+          ctx.translate(cx, cy);
+          ctx.rotate((rotationDeg * Math.PI) / 180);
+          ctx.translate(-cx, -cy);
+        }
+        drawStyledText(ctx, content, { x, y, width: w, height: h, curve, fontFamily, fontWeight });
+        ctx.restore();
         resolve(canvas.toDataURL("image/png"));
       }
     };
@@ -257,7 +395,7 @@ const DEFAULT_PLACEMENTS = {
   number: { view: "modelBack", leftPct: 0.5, topPct: 0.40, size: 60 },
 };
 
-function mountDraggablePlacement({ kind, type, content, onConfirm, onCancel }) {
+function mountDraggablePlacement({ kind, type, content, onConfirm, onCancel, fontOpt }) {
   const defaults = DEFAULT_PLACEMENTS[kind];
   showTab(defaults.view);
   // Tabs stay enabled on purpose -- the customer can switch Front/Back
@@ -268,11 +406,23 @@ function mountDraggablePlacement({ kind, type, content, onConfirm, onCancel }) {
   const containerWidth = imageWrap.clientWidth;
   const containerHeight = imageWrap.clientHeight;
 
+  // Curve/rotate controls are only offered for the name right now (that's
+  // what was asked for) -- they default to 0 either way, which renders
+  // identically to plain straight-line text.
+  const shapeControlsEnabled = kind === "name";
+  let curve = 0, rotationDeg = 0;
+  const fontFamily = fontOpt ? fontOpt.family : undefined;
+  const fontWeight = fontOpt ? fontOpt.weight : undefined;
+
   // Always a <div> for the positioned/draggable/resizable box -- <img> can't
   // render child nodes (like the resize handle), so the logo image goes
-  // INSIDE this div rather than the div itself being the <img>.
+  // INSIDE this div rather than the div itself being the <img>. Text is
+  // drawn into an inner <canvas> (via drawStyledText) rather than set as
+  // plain textContent, so the live preview can show the same curve
+  // rendering that gets baked into the final image.
   const overlay = document.createElement("div");
   overlay.className = type === "image" ? "drag-overlay-logo" : "drag-overlay-text";
+  let previewCanvas = null;
   if (type === "image") {
     const innerImg = document.createElement("img");
     innerImg.src = content;
@@ -282,7 +432,31 @@ function mountDraggablePlacement({ kind, type, content, onConfirm, onCancel }) {
     innerImg.style.pointerEvents = "none";
     overlay.appendChild(innerImg);
   } else {
-    overlay.textContent = content;
+    previewCanvas = document.createElement("canvas");
+    previewCanvas.style.position = "absolute";
+    previewCanvas.style.left = "0";
+    previewCanvas.style.top = "0";
+    previewCanvas.style.width = "100%";
+    previewCanvas.style.height = "100%";
+    previewCanvas.style.pointerEvents = "none";
+    overlay.appendChild(previewCanvas);
+  }
+
+  // The box itself grows/shrinks taller as the curve increases (the
+  // "sagitta" of the arc) so the visible outline always fits the actual
+  // curved shape, instead of staying a flat rectangle the text spills out
+  // of. Width doesn't need to change -- the arc math keeps the two end
+  // letters at the same horizontal span as the flat layout.
+  function redrawTextPreview(effectiveHeight) {
+    if (!previewCanvas) return;
+    const ch = Math.max(1, Math.round(effectiveHeight));
+    previewCanvas.width = Math.max(1, Math.round(width));
+    previewCanvas.height = ch;
+    const pctx = previewCanvas.getContext("2d");
+    pctx.clearRect(0, 0, previewCanvas.width, ch);
+    const boxY = (ch - height) / 2;
+    drawCurveGuide(pctx, { x: 0, y: boxY, width: previewCanvas.width, height, curve });
+    drawStyledText(pctx, content, { x: 0, y: boxY, width: previewCanvas.width, height, curve, fontFamily, fontWeight });
   }
 
   const minSize = type === "image" ? 24 : 16;
@@ -302,11 +476,14 @@ function mountDraggablePlacement({ kind, type, content, onConfirm, onCancel }) {
   }
   function applyStyle() {
     clamp();
+    const sagitta = type === "image" ? 0 : curveGeometry(curve, width).sagitta;
+    const effectiveHeight = height + sagitta;
     overlay.style.left = `${left}px`;
-    overlay.style.top = `${top}px`;
+    overlay.style.top = `${top - sagitta / 2}px`;
     overlay.style.width = `${width}px`;
-    if (type === "image") overlay.style.height = `${height}px`;
-    else overlay.style.fontSize = `${height}px`;
+    overlay.style.height = `${effectiveHeight}px`;
+    overlay.style.transform = rotationDeg ? `rotate(${rotationDeg}deg)` : "";
+    if (type !== "image") redrawTextPreview(effectiveHeight);
   }
   applyStyle();
   imageWrap.appendChild(overlay);
@@ -315,9 +492,18 @@ function mountDraggablePlacement({ kind, type, content, onConfirm, onCancel }) {
   handle.className = "resize-handle";
   overlay.appendChild(handle);
 
+  let rotateHandle = null;
+  if (shapeControlsEnabled) {
+    rotateHandle = document.createElement("div");
+    rotateHandle.className = "rotate-handle";
+    rotateHandle.title = "Drag to rotate";
+    rotateHandle.textContent = "↻";
+    overlay.appendChild(rotateHandle);
+  }
+
   let dragging = false, startX, startY, startLeft, startTop;
   overlay.addEventListener("pointerdown", (e) => {
-    if (e.target === handle) return;
+    if (e.target === handle || e.target === rotateHandle) return;
     dragging = true;
     startX = e.clientX;
     startY = e.clientY;
@@ -346,19 +532,82 @@ function mountDraggablePlacement({ kind, type, content, onConfirm, onCancel }) {
   handle.addEventListener("pointermove", (e) => {
     if (!resizing) return;
     e.stopPropagation();
-    const delta = ((e.clientX - resizeStartX) + (e.clientY - resizeStartY)) / 2;
-    setSize(resizeStartHeight + delta);
+    // Rotate the raw mouse delta back into the box's own (unrotated) frame
+    // first, so dragging still feels like grow/shrink even when the box
+    // itself is angled.
+    const rawDx = e.clientX - resizeStartX;
+    const rawDy = e.clientY - resizeStartY;
+    const rad = (-rotationDeg * Math.PI) / 180;
+    const dx = rawDx * Math.cos(rad) - rawDy * Math.sin(rad);
+    const dy = rawDx * Math.sin(rad) + rawDy * Math.cos(rad);
+    setSize(resizeStartHeight + (dx + dy) / 2);
     applyStyle();
   });
   handle.addEventListener("pointerup", (e) => { e.stopPropagation(); resizing = false; });
   handle.addEventListener("pointercancel", (e) => { e.stopPropagation(); resizing = false; });
+
+  if (rotateHandle) {
+    let rotating = false;
+    rotateHandle.addEventListener("pointerdown", (e) => {
+      e.stopPropagation();
+      rotating = true;
+      try { rotateHandle.setPointerCapture(e.pointerId); } catch (err) { /* fine without capture too */ }
+    });
+    rotateHandle.addEventListener("pointermove", (e) => {
+      if (!rotating) return;
+      e.stopPropagation();
+      const rect = overlay.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      const angle = (Math.atan2(e.clientY - cy, e.clientX - cx) * 180) / Math.PI;
+      rotationDeg = Math.round(angle + 90);
+      overlay.style.transform = `rotate(${rotationDeg}deg)`;
+    });
+    rotateHandle.addEventListener("pointerup", (e) => { e.stopPropagation(); rotating = false; });
+    rotateHandle.addEventListener("pointercancel", (e) => { e.stopPropagation(); rotating = false; });
+  }
 
   function cleanup() {
     overlay.remove();
   }
 
   mountWidget((wrap) => {
-    wrap.innerHTML = `<div class="hint" style="margin:0;">Drag to move, drag the corner handle to resize. Switch Front/Back above if you want it on the other side.</div>`;
+    wrap.innerHTML = `<div class="hint" style="margin:0;">Drag to move, drag the corner handle to resize${shapeControlsEnabled ? ", drag the round handle above it to rotate" : ""}. Switch Front/Back above if you want it on the other side.</div>`;
+
+    if (shapeControlsEnabled) {
+      const shapeRow = document.createElement("div");
+      shapeRow.className = "field-row";
+
+      const curveField = document.createElement("div");
+      curveField.className = "field";
+      const curveLabel = document.createElement("label");
+      curveLabel.textContent = "Curve";
+      const curveInput = document.createElement("input");
+      curveInput.type = "range";
+      curveInput.min = "-100";
+      curveInput.max = "100";
+      curveInput.value = "0";
+      curveInput.addEventListener("input", () => {
+        curve = Number(curveInput.value);
+        applyStyle();
+      });
+      curveField.appendChild(curveLabel);
+      curveField.appendChild(curveInput);
+
+      shapeRow.appendChild(curveField);
+      wrap.appendChild(shapeRow);
+
+      const resetBtn = document.createElement("button");
+      resetBtn.type = "button";
+      resetBtn.className = "chip-btn";
+      resetBtn.textContent = "Reset shape";
+      resetBtn.addEventListener("click", () => {
+        curve = 0; rotationDeg = 0;
+        curveInput.value = "0";
+        applyStyle();
+      });
+      wrap.appendChild(resetBtn);
+    }
 
     const btnRow = document.createElement("div");
     btnRow.className = "chip-row";
@@ -375,7 +624,8 @@ function mountDraggablePlacement({ kind, type, content, onConfirm, onCancel }) {
       const targetView = activeTab; // whichever tab is showing right now
       try {
         const newDataUrl = await flattenOverlayToImage(
-          state.images[targetView], type, content, left, top, width, height, containerWidth, containerHeight
+          state.images[targetView], type, content, left, top, width, height, containerWidth, containerHeight,
+          { curve, rotationDeg, fontFamily, fontWeight }
         );
         state.images[targetView] = newDataUrl;
         cleanup();
@@ -692,25 +942,64 @@ function placeLogoOnce(dataUrl) {
 function askName() {
   addMessage("Want a team or player name added? Tell me what it should say — or skip.", "bot");
   composerTextOnly("e.g. EAGLES", () => { state.name.wanted = false; askNumber(); }, (text) => {
-    state.name = { wanted: true, text, placement: "positioned by drag" };
-    placeNameOnce(text);
+    askNameFont(text, (fontOpt) => {
+      state.name = { wanted: true, text, placement: "positioned by drag", font: fontOpt };
+      placeNameOnce(text, fontOpt);
+    });
+  });
+}
+
+// A specimen grid -- each option shows the customer's own name text
+// rendered in that font, not just a generic label, so the choice is
+// judged on how their actual name looks rather than an abstract sample.
+async function askNameFont(text, onDone) {
+  addMessage("Pick a font style for the name:", "bot");
+  await fontsReady;
+  mountWidget((wrap) => {
+    const grid = document.createElement("div");
+    grid.className = "font-grid";
+    FONT_OPTIONS.forEach((opt) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "font-choice";
+      const sample = document.createElement("span");
+      sample.className = "font-choice-sample";
+      sample.textContent = text;
+      sample.style.fontFamily = opt.family;
+      sample.style.fontWeight = opt.weight;
+      const label = document.createElement("span");
+      label.className = "font-choice-label";
+      label.textContent = opt.label;
+      btn.appendChild(sample);
+      btn.appendChild(label);
+      btn.addEventListener("click", () => {
+        wrap.remove();
+        addMessage(opt.label, "user");
+        onDone(opt);
+      });
+      grid.appendChild(btn);
+    });
+    wrap.appendChild(grid);
   });
 }
 
 // Same reasoning as logo: re-asks for fresh text on "yes" (could be a
 // different name for a different spot) rather than assuming a repeat of
 // the same text.
-function placeNameOnce(text) {
+function placeNameOnce(text, fontOpt) {
   addMessage("Position the name: drag it into place, switch Front/Back if needed, resize with the corner handle, then confirm.", "bot");
   mountDraggablePlacement({
     kind: "name",
     type: "text",
     content: text,
+    fontOpt,
     onConfirm: () => {
       addMessage("Do you want to add another name?", "bot");
       composerChips([
         { label: "Yes", onClick: () => {
-          composerTextOnly("e.g. EAGLES", askNumber, (newText) => placeNameOnce(newText));
+          composerTextOnly("e.g. EAGLES", askNumber, (newText) => {
+            askNameFont(newText, (newFontOpt) => placeNameOnce(newText, newFontOpt));
+          });
         } },
         { label: "No, that's it", onClick: askNumber },
       ]);

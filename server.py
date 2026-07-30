@@ -136,10 +136,17 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/health":
             self._json(200, {"ok": True, "key_configured": bool(OPENAI_API_KEY)})
             return
-        if self.path in STATIC_FILES:
+        if self.path in STATIC_FILES or (self.path.startswith("/fonts/") and ".." not in self.path):
             filename = "index.html" if self.path == "/" else self.path.lstrip("/")
             filepath = os.path.join(ROOT, filename)
+            if not os.path.isfile(filepath):
+                self._json(404, {"error": "not found"})
+                return
             content_type, _ = mimetypes.guess_type(filepath)
+            if filepath.endswith(".otf"):
+                content_type = "font/otf"
+            elif filepath.endswith(".ttf"):
+                content_type = "font/ttf"
             with open(filepath, "rb") as f:
                 content = f.read()
             self.send_response(200)
