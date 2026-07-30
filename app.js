@@ -29,7 +29,7 @@ const state = {
 };
 
 // ---------- Prompt building ----------
-const FRAMING_RULE = "Full-length shot: the ENTIRE garment must be visible in frame, from the shoulders/collar all the way down to the hem - never crop off the bottom or any part of the garment.";
+const FRAMING_RULE = "Full-length shot: EVERY piece of the outfit must be completely visible in frame with nothing cropped off. If the outfit has multiple pieces (e.g. a top AND shorts/pants), frame wide enough to show the full length of ALL pieces together, from the shoulders/collar all the way down to the bottom hem of the LOWEST garment (not just the top) - step the camera back if needed rather than cropping any piece out.";
 
 function fullDesignDescription() {
   let desc = state.designRaw;
