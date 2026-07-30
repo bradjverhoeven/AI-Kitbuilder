@@ -26,10 +26,17 @@ const state = {
   number: { wanted: false, text: "", placement: "" },
   contactName: "",
   contactEmail: "",
+  history: [], // [{ id, label, front, back }] — every version generated, for click-to-revert
 };
+let historyIdCounter = 0;
 
 // ---------- Prompt building ----------
 const FRAMING_RULE = "Full-length shot: EVERY piece of the outfit must be completely visible in frame with nothing cropped off. If the outfit has multiple pieces (e.g. a top AND shorts/pants), frame wide enough to show the full length of ALL pieces together, from the shoulders/collar all the way down to the bottom hem of the LOWEST garment (not just the top) - step the camera back if needed rather than cropping any piece out.";
+
+// BOUNDARY: colours only change when explicitly asked. A tweak request like
+// "make it look like ocean waves" describes a PATTERN/STYLE, not permission
+// to recolour the garment to blue just because the theme suggests it.
+const COLOR_LOCK_RULE = "Colour rule: keep the exact colours already established on this garment unless the customer explicitly asks to change a colour. Apply any requested pattern, style, or theme (e.g. \"ocean waves\", \"flames\", \"camo\") using ONLY the existing colour palette - do not reinterpret a theme word as a reason to change the colours.";
 
 function fullDesignDescription() {
   let desc = state.designRaw;
@@ -161,9 +168,56 @@ els.downloadBtn.addEventListener("click", () => {
   document.body.removeChild(a);
 });
 
+// ---------- Version history ----------
+const historyStrip = document.getElementById("history-strip");
+const historyThumbs = document.getElementById("history-thumbs");
+
+function pushHistory(label) {
+  if (!state.images.modelFront || !state.images.modelBack) return;
+  state.history.push({
+    id: ++historyIdCounter,
+    label,
+    front: state.images.modelFront,
+    back: state.images.modelBack,
+  });
+  renderHistory();
+}
+
+function renderHistory() {
+  if (!state.history.length) { historyStrip.style.display = "none"; return; }
+  historyStrip.style.display = "block";
+  historyThumbs.innerHTML = "";
+  state.history.forEach((entry) => {
+    const isActive = state.images.modelFront === entry.front;
+    const thumb = document.createElement("div");
+    thumb.className = `history-thumb${isActive ? " active" : ""}`;
+    const img = document.createElement("img");
+    img.src = entry.front;
+    img.alt = entry.label;
+    const labelDiv = document.createElement("div");
+    labelDiv.className = "history-thumb-label";
+    labelDiv.textContent = entry.label;
+    thumb.appendChild(img);
+    thumb.appendChild(labelDiv);
+    thumb.addEventListener("click", () => {
+      if (state.images.modelFront === entry.front) return;
+      state.images.modelFront = entry.front;
+      state.images.modelBack = entry.back;
+      showTab("modelFront");
+      renderHistory();
+      addMessage(`Went back to: ${entry.label}`, "user");
+    });
+    historyThumbs.appendChild(thumb);
+  });
+  historyThumbs.scrollLeft = historyThumbs.scrollWidth;
+}
+
 // ---------- Chat engine ----------
+// Every interactive prompt (buttons AND inputs) mounts as an inline widget
+// inside the chat log itself, right where the conversation is — not in a
+// separate fixed bar. Once answered, the widget is replaced by an echoed
+// user message, same as a normal chat thread.
 const chatLog = document.getElementById("chat-log");
-const composer = document.getElementById("composer");
 
 function addMessage(text, from) {
   const div = document.createElement("div");
@@ -174,150 +228,154 @@ function addMessage(text, from) {
   return div;
 }
 
-function clearComposer() { composer.innerHTML = ""; }
+function mountWidget(buildFn) {
+  const wrap = document.createElement("div");
+  wrap.className = "inline-widget";
+  buildFn(wrap);
+  chatLog.appendChild(wrap);
+  chatLog.scrollTop = chatLog.scrollHeight;
+  return wrap;
+}
 
 function composerText(placeholder, onSubmit) {
-  clearComposer();
-  const row = document.createElement("div");
-  row.className = "composer-row";
-  const input = document.createElement("input");
-  input.type = "text";
-  input.placeholder = placeholder;
-  const btn = document.createElement("button");
-  btn.className = "btn-primary";
-  btn.textContent = "Send";
-  const submit = () => {
-    const val = input.value.trim();
-    if (!val) return;
-    addMessage(val, "user");
-    clearComposer();
-    onSubmit(val);
-  };
-  btn.addEventListener("click", submit);
-  input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
-  row.appendChild(input);
-  row.appendChild(btn);
-  composer.appendChild(row);
-  input.focus();
+  mountWidget((wrap) => {
+    const row = document.createElement("div");
+    row.className = "composer-row";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.placeholder = placeholder;
+    const btn = document.createElement("button");
+    btn.className = "btn-primary";
+    btn.textContent = "Send";
+    const submit = () => {
+      const val = input.value.trim();
+      if (!val) return;
+      wrap.remove();
+      addMessage(val, "user");
+      onSubmit(val);
+    };
+    btn.addEventListener("click", submit);
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+    row.appendChild(input);
+    row.appendChild(btn);
+    wrap.appendChild(row);
+    input.focus();
+  });
 }
 
 function composerChips(options) {
-  clearComposer();
-  const row = document.createElement("div");
-  row.className = "chip-row";
-  options.forEach((opt) => {
-    const btn = document.createElement("button");
-    btn.className = "chip-btn";
-    btn.textContent = opt.label;
-    btn.addEventListener("click", () => { clearComposer(); opt.onClick(); });
-    row.appendChild(btn);
+  mountWidget((wrap) => {
+    const row = document.createElement("div");
+    row.className = "chip-row";
+    options.forEach((opt) => {
+      const btn = document.createElement("button");
+      btn.className = "chip-btn";
+      btn.textContent = opt.label;
+      btn.addEventListener("click", () => {
+        wrap.remove();
+        addMessage(opt.label, "user");
+        opt.onClick();
+      });
+      row.appendChild(btn);
+    });
+    wrap.appendChild(row);
   });
-  composer.appendChild(row);
 }
 
-function composerUploadAndPlace(label, onSkip, onAdd) {
-  clearComposer();
-  const wrap = document.createElement("div");
-  wrap.innerHTML = `
-    <div class="field"><label>Upload file</label><input type="file" id="c-file" accept="image/*" /></div>
-    <div class="field"><label>Where should it go?</label><input type="text" id="c-place" placeholder="e.g. left chest, sleeve, back" /></div>
-  `;
-  composer.appendChild(wrap);
-  const btnRow = document.createElement("div");
-  btnRow.className = "chip-row";
-  btnRow.style.marginTop = "8px";
-  const skipBtn = document.createElement("button");
-  skipBtn.className = "chip-btn";
-  skipBtn.textContent = "Skip — not needed";
-  skipBtn.addEventListener("click", () => { addMessage("Skip", "user"); clearComposer(); onSkip(); });
-  const addBtn = document.createElement("button");
-  addBtn.className = "btn-primary";
-  addBtn.textContent = label;
-  addBtn.addEventListener("click", () => {
+// Two separate steps on purpose: upload first (can't proceed with no file
+// actually chosen), then placement as its own follow-up question.
+function composerUploadOnly(uploadLabel, onSkip, onUploaded) {
+  mountWidget((wrap) => {
+    wrap.innerHTML = `<div class="field"><label>Upload file</label><input type="file" id="c-file" accept="image/*" /></div>`;
+    const btnRow = document.createElement("div");
+    btnRow.className = "chip-row";
+    const skipBtn = document.createElement("button");
+    skipBtn.className = "chip-btn";
+    skipBtn.textContent = "Skip — not needed";
+    skipBtn.addEventListener("click", () => { wrap.remove(); addMessage("Skip", "user"); onSkip(); });
+    const addBtn = document.createElement("button");
+    addBtn.className = "btn-primary";
+    addBtn.textContent = uploadLabel;
+    addBtn.disabled = true; // only enabled once a real file is chosen
     const fileInput = wrap.querySelector("#c-file");
-    const place = wrap.querySelector("#c-place").value.trim();
-    const file = fileInput.files[0];
-    if (!file) {
-      addMessage(`Placement: ${place || "(not specified)"}`, "user");
-      clearComposer();
-      onAdd({ placement: place, dataUrl: null });
-      return;
-    }
-    const reader = new FileReader();
-    reader.onload = () => {
-      addMessage(`Uploaded file — placement: ${place || "(not specified)"}`, "user");
-      clearComposer();
-      onAdd({ placement: place, dataUrl: reader.result });
-    };
-    reader.readAsDataURL(file);
+    fileInput.addEventListener("change", () => { addBtn.disabled = !fileInput.files[0]; });
+    addBtn.addEventListener("click", () => {
+      const file = fileInput.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        wrap.remove();
+        addMessage("Uploaded file", "user");
+        onUploaded(reader.result);
+      };
+      reader.readAsDataURL(file);
+    });
+    btnRow.appendChild(skipBtn);
+    btnRow.appendChild(addBtn);
+    wrap.appendChild(btnRow);
   });
-  btnRow.appendChild(skipBtn);
-  btnRow.appendChild(addBtn);
-  composer.appendChild(btnRow);
 }
 
 function composerTextAndPlace(label, onSkip, onAdd) {
-  clearComposer();
-  const wrap = document.createElement("div");
-  wrap.innerHTML = `
-    <div class="field"><label>Text</label><input type="text" id="c-text" placeholder="e.g. EAGLES or 9" /></div>
-    <div class="field"><label>Where should it go?</label><input type="text" id="c-place" placeholder="e.g. back, front, sleeve" /></div>
-  `;
-  composer.appendChild(wrap);
-  const btnRow = document.createElement("div");
-  btnRow.className = "chip-row";
-  btnRow.style.marginTop = "8px";
-  const skipBtn = document.createElement("button");
-  skipBtn.className = "chip-btn";
-  skipBtn.textContent = "Skip — not needed";
-  skipBtn.addEventListener("click", () => { addMessage("Skip", "user"); clearComposer(); onSkip(); });
-  const addBtn = document.createElement("button");
-  addBtn.className = "btn-primary";
-  addBtn.textContent = label;
-  addBtn.addEventListener("click", () => {
-    const text = wrap.querySelector("#c-text").value.trim();
-    const place = wrap.querySelector("#c-place").value.trim();
-    if (!text) return;
-    addMessage(`${text} — placement: ${place || "(not specified)"}`, "user");
-    clearComposer();
-    onAdd({ text, placement: place });
+  mountWidget((wrap) => {
+    wrap.innerHTML = `
+      <div class="field"><label>Text</label><input type="text" id="c-text" placeholder="e.g. EAGLES or 9" /></div>
+      <div class="field"><label>Where should it go?</label><input type="text" id="c-place" placeholder="e.g. back, front, sleeve" /></div>
+    `;
+    const btnRow = document.createElement("div");
+    btnRow.className = "chip-row";
+    const skipBtn = document.createElement("button");
+    skipBtn.className = "chip-btn";
+    skipBtn.textContent = "Skip — not needed";
+    skipBtn.addEventListener("click", () => { wrap.remove(); addMessage("Skip", "user"); onSkip(); });
+    const addBtn = document.createElement("button");
+    addBtn.className = "btn-primary";
+    addBtn.textContent = label;
+    addBtn.addEventListener("click", () => {
+      const text = wrap.querySelector("#c-text").value.trim();
+      const place = wrap.querySelector("#c-place").value.trim();
+      if (!text) return;
+      wrap.remove();
+      addMessage(`${text} — placement: ${place || "(not specified)"}`, "user");
+      onAdd({ text, placement: place });
+    });
+    btnRow.appendChild(skipBtn);
+    btnRow.appendChild(addBtn);
+    wrap.appendChild(btnRow);
   });
-  btnRow.appendChild(skipBtn);
-  btnRow.appendChild(addBtn);
-  composer.appendChild(btnRow);
 }
 
 function composerContactForm(onDone) {
-  clearComposer();
-  const wrap = document.createElement("div");
-  wrap.innerHTML = `
-    <div class="field"><label>Your name</label><input type="text" id="c-name" placeholder="e.g. Francine Miller" /></div>
-    <div class="field"><label>Your email</label><input type="email" id="c-email" placeholder="you@example.com" /></div>
-  `;
-  composer.appendChild(wrap);
-  const btnRow = document.createElement("div");
-  btnRow.className = "chip-row";
-  btnRow.style.marginTop = "8px";
-  const btn = document.createElement("button");
-  btn.className = "btn-primary";
-  btn.textContent = "Continue";
-  btn.addEventListener("click", () => {
-    state.contactName = wrap.querySelector("#c-name").value.trim();
-    state.contactEmail = wrap.querySelector("#c-email").value.trim();
-    clearComposer();
-    onDone();
+  mountWidget((wrap) => {
+    wrap.innerHTML = `
+      <div class="field"><label>Your name</label><input type="text" id="c-name" placeholder="e.g. Francine Miller" /></div>
+      <div class="field"><label>Your email</label><input type="email" id="c-email" placeholder="you@example.com" /></div>
+    `;
+    const btnRow = document.createElement("div");
+    btnRow.className = "chip-row";
+    const btn = document.createElement("button");
+    btn.className = "btn-primary";
+    btn.textContent = "Continue";
+    btn.addEventListener("click", () => {
+      state.contactName = wrap.querySelector("#c-name").value.trim();
+      state.contactEmail = wrap.querySelector("#c-email").value.trim();
+      wrap.remove();
+      addMessage(`${state.contactName} — ${state.contactEmail}`, "user");
+      onDone();
+    });
+    btnRow.appendChild(btn);
+    wrap.appendChild(btnRow);
   });
-  btnRow.appendChild(btn);
-  composer.appendChild(btnRow);
 }
 
 function composerReview() {
-  clearComposer();
-  const btn = document.createElement("button");
-  btn.className = "btn-primary";
-  btn.textContent = "Request a Quote";
-  btn.addEventListener("click", onRequestQuote);
-  composer.appendChild(btn);
+  mountWidget((wrap) => {
+    const btn = document.createElement("button");
+    btn.className = "btn-primary";
+    btn.textContent = "Request a Quote";
+    btn.addEventListener("click", () => { wrap.remove(); onRequestQuote(); });
+    wrap.appendChild(btn);
+  });
 }
 
 // ---------- Conversation script ----------
@@ -343,12 +401,38 @@ async function generateModelShots() {
     state.images.modelBack = back;
     enableTab("modelBack");
     showTab("modelFront");
+    pushHistory("Original concept");
 
     addMessage("Here's a concept — front and back. Want any changes, or does this look good?", "bot");
     offerTweakOrContinue();
   } catch (err) {
     addMessage(`Image generation failed: ${err.message}. Let's try describing it again.`, "bot");
     composerText("Describe the design again", (val) => { state.designRaw = val; generateModelShots(); });
+  }
+}
+
+// Tweaks EDIT the existing image (img2img) rather than regenerating from
+// text alone -- keeps colours/design anchored to what's already there
+// instead of the model re-rolling the whole thing fresh each time.
+async function applyTweak(tweakText) {
+  setLoading("Applying your changes…");
+  try {
+    const frontPrompt = `Modify this exact garment based on this request: "${tweakText}". ${COLOR_LOCK_RULE} Original design brief for reference: "${state.designRaw}". ${FRAMING_RULE}`;
+    const front = await editImage([state.images.modelFront], frontPrompt);
+    state.images.modelFront = front;
+    showTab("modelFront");
+
+    setLoading("Updating the back view…");
+    const back = await editImage([front], buildModelBackEditPrompt());
+    state.images.modelBack = back;
+    showTab("modelFront");
+    pushHistory(`Tweak: ${tweakText}`);
+
+    addMessage("Here's the updated concept — front and back. Want any further changes, or does this look good?", "bot");
+    offerTweakOrContinue();
+  } catch (err) {
+    addMessage(`Couldn't apply that change (${err.message}). Let's continue with what we have.`, "bot");
+    offerTweakOrContinue();
   }
 }
 
@@ -365,16 +449,23 @@ function offerTweakOrContinue() {
       composerText("What should we change?", (val) => {
         state.tweaks.push(val);
         state.tweakCount += 1;
-        generateModelShots();
+        applyTweak(val);
       });
     } },
   ]);
 }
 
 function askLogo() {
-  addMessage("Want a logo added? Upload it and tell me where it should go — or skip if you don't need one.", "bot");
-  composerUploadAndPlace("Add logo", () => { state.logo.wanted = false; askName(); }, (result) => {
-    state.logo = { wanted: true, placement: result.placement, dataUrl: result.dataUrl };
+  addMessage("Want a logo added? Upload the file, or skip if you don't need one.", "bot");
+  composerUploadOnly("Upload logo", () => { state.logo.wanted = false; askName(); }, (dataUrl) => {
+    askLogoPlacement(dataUrl);
+  });
+}
+
+function askLogoPlacement(dataUrl) {
+  addMessage("Where should the logo go? (e.g. left chest, sleeve, back)", "bot");
+  composerText("e.g. left chest", (place) => {
+    state.logo = { wanted: true, placement: place, dataUrl };
     applyExtraNow(logoText("front"), logoText("back"), true, askName, "logo");
   });
 }
@@ -410,7 +501,7 @@ async function applyExtraNow(frontText, backText, includeLogoImage, nextStepFn, 
       const logoNote = includeLogoImage && state.logo.dataUrl
         ? " A logo reference image is included as an additional image — composite that exact logo onto the garment at the described position, sized like a real chest logo."
         : "";
-      state.images.modelFront = await editImage(imgs, `Apply the following to this garment, changing nothing else about the model, pose, lighting, background, garment colours or pattern: ${frontText}${logoNote} ${FRAMING_RULE}`);
+      state.images.modelFront = await editImage(imgs, `Apply the following to this garment, changing nothing else about the model, pose, lighting, background, or pattern: ${frontText}${logoNote} ${COLOR_LOCK_RULE} ${FRAMING_RULE}`);
       showTab("modelFront");
     }
     if (backText) {
@@ -419,9 +510,10 @@ async function applyExtraNow(frontText, backText, includeLogoImage, nextStepFn, 
       const logoNote = includeLogoImage && state.logo.dataUrl
         ? " A logo reference image is included as an additional image — composite that exact logo onto the garment at the described position."
         : "";
-      state.images.modelBack = await editImage(imgs, `Apply the following to this garment, changing nothing else about the model, pose, lighting, background, garment colours or pattern: ${backText}${logoNote} ${FRAMING_RULE}`);
+      state.images.modelBack = await editImage(imgs, `Apply the following to this garment, changing nothing else about the model, pose, lighting, background, or pattern: ${backText}${logoNote} ${COLOR_LOCK_RULE} ${FRAMING_RULE}`);
       showTab(frontText ? activeTab : "modelBack");
     }
+    pushHistory(`Added ${label}`);
     addMessage(`${label[0].toUpperCase()}${label.slice(1)} added.`, "bot");
   } catch (err) {
     showTab("modelFront");
@@ -468,7 +560,6 @@ function renderImageFigure(container, src, label) {
 }
 
 function onRequestQuote() {
-  clearComposer();
   document.getElementById("modal-reseller-name").textContent = RESELLER_CONFIG.name;
   quoteJson.textContent = JSON.stringify(buildSpec(), null, 2);
   quoteImages.innerHTML = "";
