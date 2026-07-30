@@ -44,40 +44,6 @@ function fullDesignDescription() {
   return desc;
 }
 
-function mentionsBack(placement) { return /back/i.test(placement || ""); }
-function mentionsFront(placement) { return /front|chest/i.test(placement || ""); }
-
-// Per-extra, per-view text — each returns '' unless that extra is wanted AND
-// placed on that view, so logo/name/number only ever render where they belong.
-function logoText(view) {
-  if (!state.logo.wanted) return "";
-  const onFront = mentionsFront(state.logo.placement) || !state.logo.placement;
-  const onBack = mentionsBack(state.logo.placement);
-  if ((view === "front" && onFront) || (view === "back" && onBack)) {
-    return `Includes a logo positioned at ${state.logo.placement || "left chest"}.`;
-  }
-  return "";
-}
-
-function nameText(view) {
-  if (!state.name.wanted) return "";
-  const onBack = mentionsBack(state.name.placement) || !state.name.placement;
-  const onFront = mentionsFront(state.name.placement);
-  if ((view === "back" && onBack) || (view === "front" && onFront)) {
-    return `Team/player name "${state.name.text}" positioned at ${state.name.placement || "upper back"}.`;
-  }
-  return "";
-}
-
-function numberText(view) {
-  if (!state.number.wanted) return "";
-  const onBack = mentionsBack(state.number.placement) || !state.number.placement;
-  const onFront = mentionsFront(state.number.placement);
-  if ((view === "back" && onBack) || (view === "front" && onFront)) {
-    return `Number "${state.number.text}" positioned at ${state.number.placement || "centre back"}.`;
-  }
-  return "";
-}
 
 function buildModelFrontPrompt() {
   return `Professional sportswear catalog photograph of a model wearing a custom sublimated garment, front view, facing the camera. Design: ${fullDesignDescription()}. Studio lighting, plain light grey background, realistic fabric texture. ${FRAMING_RULE}`;
@@ -212,6 +178,199 @@ function renderHistory() {
   historyThumbs.scrollLeft = historyThumbs.scrollWidth;
 }
 
+// ---------- Drag-to-position compositor ----------
+// Logo/name/number are placed by the CUSTOMER dragging them directly onto
+// the photo and flattened in with canvas -- zero AI calls, so it's instant.
+// (No AI blending means it can look "pasted on" rather than wrapped into
+// the fabric -- traded on purpose for speed; easy to revert if it doesn't
+// hold up.)
+const imageWrap = document.querySelector(".image-wrap");
+
+function flattenOverlayToImage(baseDataUrl, type, content, left, top, width, height, containerWidth, containerHeight) {
+  return new Promise((resolve, reject) => {
+    const baseImg = new Image();
+    baseImg.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = baseImg.naturalWidth;
+      canvas.height = baseImg.naturalHeight;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(baseImg, 0, 0, canvas.width, canvas.height);
+
+      const scaleX = canvas.width / containerWidth;
+      const scaleY = canvas.height / containerHeight;
+      const x = left * scaleX;
+      const y = top * scaleY;
+      const w = width * scaleX;
+      const h = height * scaleY;
+
+      if (type === "image") {
+        const logoImg = new Image();
+        logoImg.onload = () => {
+          ctx.drawImage(logoImg, x, y, w, h);
+          resolve(canvas.toDataURL("image/png"));
+        };
+        logoImg.onerror = reject;
+        logoImg.src = content;
+      } else {
+        const fontSize = h;
+        ctx.font = `bold ${fontSize}px Arial, sans-serif`;
+        ctx.textBaseline = "top";
+        ctx.textAlign = "left";
+        ctx.lineWidth = Math.max(2, fontSize * 0.08);
+        ctx.strokeStyle = "black";
+        ctx.fillStyle = "white";
+        ctx.strokeText(content, x, y);
+        ctx.fillText(content, x, y);
+        resolve(canvas.toDataURL("image/png"));
+      }
+    };
+    baseImg.onerror = reject;
+    baseImg.src = baseDataUrl;
+  });
+}
+
+const DEFAULT_PLACEMENTS = {
+  logo: { view: "modelFront", leftPct: 0.58, topPct: 0.20, size: 60 },
+  name: { view: "modelBack", leftPct: 0.5, topPct: 0.16, size: 32 },
+  number: { view: "modelBack", leftPct: 0.5, topPct: 0.40, size: 60 },
+};
+
+function mountDraggablePlacement({ kind, type, content, onConfirm, onCancel }) {
+  const defaults = DEFAULT_PLACEMENTS[kind];
+  showTab(defaults.view);
+  els.tabs.forEach((b) => { b.disabled = true; });
+
+  const containerWidth = imageWrap.clientWidth;
+  const containerHeight = imageWrap.clientHeight;
+
+  // Always a <div> for the positioned/draggable/resizable box -- <img> can't
+  // render child nodes (like the resize handle), so the logo image goes
+  // INSIDE this div rather than the div itself being the <img>.
+  const overlay = document.createElement("div");
+  overlay.className = type === "image" ? "drag-overlay-logo" : "drag-overlay-text";
+  if (type === "image") {
+    const innerImg = document.createElement("img");
+    innerImg.src = content;
+    innerImg.style.width = "100%";
+    innerImg.style.height = "100%";
+    innerImg.style.display = "block";
+    innerImg.style.pointerEvents = "none";
+    overlay.appendChild(innerImg);
+  } else {
+    overlay.textContent = content;
+  }
+
+  const minSize = type === "image" ? 24 : 16;
+  const maxSize = type === "image" ? 220 : 110;
+  let height = defaults.size;
+  let width = type === "image" ? defaults.size : Math.min(containerWidth * 0.9, content.length * defaults.size * 0.62 + 16);
+  let left = containerWidth * defaults.leftPct - width / 2;
+  let top = containerHeight * defaults.topPct - height / 2;
+
+  function setSize(newHeight) {
+    height = Math.max(minSize, Math.min(maxSize, newHeight));
+    width = type === "image" ? height : Math.min(containerWidth * 0.9, content.length * height * 0.62 + 16);
+  }
+  function clamp() {
+    left = Math.max(0, Math.min(containerWidth - width, left));
+    top = Math.max(0, Math.min(containerHeight - height, top));
+  }
+  function applyStyle() {
+    clamp();
+    overlay.style.left = `${left}px`;
+    overlay.style.top = `${top}px`;
+    overlay.style.width = `${width}px`;
+    if (type === "image") overlay.style.height = `${height}px`;
+    else overlay.style.fontSize = `${height}px`;
+  }
+  applyStyle();
+  imageWrap.appendChild(overlay);
+
+  const handle = document.createElement("div");
+  handle.className = "resize-handle";
+  overlay.appendChild(handle);
+
+  let dragging = false, startX, startY, startLeft, startTop;
+  overlay.addEventListener("pointerdown", (e) => {
+    if (e.target === handle) return;
+    dragging = true;
+    startX = e.clientX;
+    startY = e.clientY;
+    startLeft = left;
+    startTop = top;
+    try { overlay.setPointerCapture(e.pointerId); } catch (err) { /* fine without capture too */ }
+  });
+  overlay.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    left = startLeft + (e.clientX - startX);
+    top = startTop + (e.clientY - startY);
+    applyStyle();
+  });
+  overlay.addEventListener("pointerup", () => { dragging = false; });
+  overlay.addEventListener("pointercancel", () => { dragging = false; });
+
+  let resizing = false, resizeStartX, resizeStartY, resizeStartHeight;
+  handle.addEventListener("pointerdown", (e) => {
+    e.stopPropagation();
+    resizing = true;
+    resizeStartX = e.clientX;
+    resizeStartY = e.clientY;
+    resizeStartHeight = height;
+    try { handle.setPointerCapture(e.pointerId); } catch (err) { /* fine without capture too */ }
+  });
+  handle.addEventListener("pointermove", (e) => {
+    if (!resizing) return;
+    e.stopPropagation();
+    const delta = ((e.clientX - resizeStartX) + (e.clientY - resizeStartY)) / 2;
+    setSize(resizeStartHeight + delta);
+    applyStyle();
+  });
+  handle.addEventListener("pointerup", (e) => { e.stopPropagation(); resizing = false; });
+  handle.addEventListener("pointercancel", (e) => { e.stopPropagation(); resizing = false; });
+
+  function cleanup() {
+    overlay.remove();
+    els.tabs.forEach((b) => { b.disabled = false; });
+  }
+
+  mountWidget((wrap) => {
+    wrap.innerHTML = `<div class="hint" style="margin:0;">Drag to move, drag the corner handle to resize.</div>`;
+
+    const btnRow = document.createElement("div");
+    btnRow.className = "chip-row";
+    const skipBtn = document.createElement("button");
+    skipBtn.className = "chip-btn";
+    skipBtn.textContent = "Cancel";
+    skipBtn.addEventListener("click", () => { cleanup(); wrap.remove(); addMessage("Cancel", "user"); onCancel(); });
+    const confirmBtn = document.createElement("button");
+    confirmBtn.className = "btn-primary";
+    confirmBtn.textContent = `Confirm ${kind} position`;
+    confirmBtn.addEventListener("click", async () => {
+      confirmBtn.disabled = true;
+      confirmBtn.textContent = "Placing…";
+      try {
+        const newDataUrl = await flattenOverlayToImage(
+          state.images[defaults.view], type, content, left, top, width, height, containerWidth, containerHeight
+        );
+        state.images[defaults.view] = newDataUrl;
+        cleanup();
+        showTab(defaults.view);
+        wrap.remove();
+        addMessage(`Positioned ${kind}`, "user");
+        pushHistory(`Added ${kind}`);
+        onConfirm();
+      } catch (err) {
+        confirmBtn.disabled = false;
+        confirmBtn.textContent = `Confirm ${kind} position`;
+        addMessage(`Couldn't place the ${kind} (${err.message || err}). Try dragging again.`, "bot");
+      }
+    });
+    btnRow.appendChild(skipBtn);
+    btnRow.appendChild(confirmBtn);
+    wrap.appendChild(btnRow);
+  });
+}
+
 // ---------- Chat engine ----------
 // Every interactive prompt (buttons AND inputs) mounts as an inline widget
 // inside the chat log itself, right where the conversation is — not in a
@@ -316,32 +475,34 @@ function composerUploadOnly(uploadLabel, onSkip, onUploaded) {
   });
 }
 
-function composerTextAndPlace(label, onSkip, onAdd) {
+function composerTextOnly(placeholder, onSkip, onSubmit) {
   mountWidget((wrap) => {
-    wrap.innerHTML = `
-      <div class="field"><label>Text</label><input type="text" id="c-text" placeholder="e.g. EAGLES or 9" /></div>
-      <div class="field"><label>Where should it go?</label><input type="text" id="c-place" placeholder="e.g. back, front, sleeve" /></div>
-    `;
-    const btnRow = document.createElement("div");
-    btnRow.className = "chip-row";
+    const row = document.createElement("div");
+    row.className = "composer-row";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.placeholder = placeholder;
     const skipBtn = document.createElement("button");
-    skipBtn.className = "chip-btn";
-    skipBtn.textContent = "Skip — not needed";
+    skipBtn.className = "btn-secondary";
+    skipBtn.textContent = "Skip";
     skipBtn.addEventListener("click", () => { wrap.remove(); addMessage("Skip", "user"); onSkip(); });
-    const addBtn = document.createElement("button");
-    addBtn.className = "btn-primary";
-    addBtn.textContent = label;
-    addBtn.addEventListener("click", () => {
-      const text = wrap.querySelector("#c-text").value.trim();
-      const place = wrap.querySelector("#c-place").value.trim();
-      if (!text) return;
+    const btn = document.createElement("button");
+    btn.className = "btn-primary";
+    btn.textContent = "Send";
+    const submit = () => {
+      const val = input.value.trim();
+      if (!val) return;
       wrap.remove();
-      addMessage(`${text} — placement: ${place || "(not specified)"}`, "user");
-      onAdd({ text, placement: place });
-    });
-    btnRow.appendChild(skipBtn);
-    btnRow.appendChild(addBtn);
-    wrap.appendChild(btnRow);
+      addMessage(val, "user");
+      onSubmit(val);
+    };
+    btn.addEventListener("click", submit);
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+    row.appendChild(input);
+    row.appendChild(skipBtn);
+    row.appendChild(btn);
+    wrap.appendChild(row);
+    input.focus();
   });
 }
 
@@ -458,68 +619,43 @@ function offerTweakOrContinue() {
 function askLogo() {
   addMessage("Want a logo added? Upload the file, or skip if you don't need one.", "bot");
   composerUploadOnly("Upload logo", () => { state.logo.wanted = false; askName(); }, (dataUrl) => {
-    askLogoPlacement(dataUrl);
-  });
-}
-
-function askLogoPlacement(dataUrl) {
-  addMessage("Where should the logo go? (e.g. left chest, sleeve, back)", "bot");
-  composerText("e.g. left chest", (place) => {
-    state.logo = { wanted: true, placement: place, dataUrl };
-    applyExtraNow(logoText("front"), logoText("back"), true, askName, "logo");
+    addMessage("Drag the logo to where you'd like it, resize if needed, then confirm.", "bot");
+    mountDraggablePlacement({
+      kind: "logo",
+      type: "image",
+      content: dataUrl,
+      onConfirm: () => { state.logo = { wanted: true, placement: "positioned by drag", dataUrl }; askName(); },
+      onCancel: () => { state.logo.wanted = false; askName(); },
+    });
   });
 }
 
 function askName() {
-  addMessage("Want a team or player name added? Tell me what it should say and where it should go — or skip.", "bot");
-  composerTextAndPlace("Add name", () => { state.name.wanted = false; askNumber(); }, (result) => {
-    state.name = { wanted: true, text: result.text, placement: result.placement };
-    applyExtraNow(nameText("front"), nameText("back"), false, askNumber, "name");
+  addMessage("Want a team or player name added? Tell me what it should say — or skip.", "bot");
+  composerTextOnly("e.g. EAGLES", () => { state.name.wanted = false; askNumber(); }, (text) => {
+    addMessage("Drag the name to where you'd like it, resize if needed, then confirm.", "bot");
+    mountDraggablePlacement({
+      kind: "name",
+      type: "text",
+      content: text,
+      onConfirm: () => { state.name = { wanted: true, text, placement: "positioned by drag" }; askNumber(); },
+      onCancel: () => { state.name.wanted = false; askNumber(); },
+    });
   });
 }
 
 function askNumber() {
-  addMessage("Want a number added? Tell me the number and where it should go — or skip.", "bot");
-  composerTextAndPlace("Add number", () => { state.number.wanted = false; askContact(); }, (result) => {
-    state.number = { wanted: true, text: result.text, placement: result.placement };
-    applyExtraNow(numberText("front"), numberText("back"), false, askContact, "number");
+  addMessage("Want a number added? Tell me the number — or skip.", "bot");
+  composerTextOnly("e.g. 9", () => { state.number.wanted = false; askContact(); }, (text) => {
+    addMessage("Drag the number to where you'd like it, resize if needed, then confirm.", "bot");
+    mountDraggablePlacement({
+      kind: "number",
+      type: "text",
+      content: text,
+      onConfirm: () => { state.number = { wanted: true, text, placement: "positioned by drag" }; askContact(); },
+      onCancel: () => { state.number.wanted = false; askContact(); },
+    });
   });
-}
-
-// Renders ONE extra (logo, name, or number) onto the model shots immediately
-// after that question is answered, then moves to the next step. Splitting
-// the render into 3 smaller steps (instead of one batch at the end) spreads
-// the wait across the conversation so it feels shorter.
-async function applyExtraNow(frontText, backText, includeLogoImage, nextStepFn, label) {
-  if (!frontText && !backText) { nextStepFn(); return; }
-  addMessage(`Adding your ${label}…`, "bot");
-  setLoading(`Adding your ${label}…`);
-  try {
-    if (frontText) {
-      const imgs = [state.images.modelFront];
-      if (includeLogoImage && state.logo.dataUrl) imgs.push(state.logo.dataUrl);
-      const logoNote = includeLogoImage && state.logo.dataUrl
-        ? " A logo reference image is included as an additional image — composite that exact logo onto the garment at the described position, sized like a real chest logo."
-        : "";
-      state.images.modelFront = await editImage(imgs, `Apply the following to this garment, changing nothing else about the model, pose, lighting, background, or pattern: ${frontText}${logoNote} ${COLOR_LOCK_RULE} ${FRAMING_RULE}`);
-      showTab("modelFront");
-    }
-    if (backText) {
-      const imgs = [state.images.modelBack];
-      if (includeLogoImage && state.logo.dataUrl) imgs.push(state.logo.dataUrl);
-      const logoNote = includeLogoImage && state.logo.dataUrl
-        ? " A logo reference image is included as an additional image — composite that exact logo onto the garment at the described position."
-        : "";
-      state.images.modelBack = await editImage(imgs, `Apply the following to this garment, changing nothing else about the model, pose, lighting, background, or pattern: ${backText}${logoNote} ${COLOR_LOCK_RULE} ${FRAMING_RULE}`);
-      showTab(frontText ? activeTab : "modelBack");
-    }
-    pushHistory(`Added ${label}`);
-    addMessage(`${label[0].toUpperCase()}${label.slice(1)} added.`, "bot");
-  } catch (err) {
-    showTab("modelFront");
-    addMessage(`Couldn't add the ${label} (${err.message}) — your details are still captured, continuing.`, "bot");
-  }
-  nextStepFn();
 }
 
 function askContact() {

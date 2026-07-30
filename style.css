@@ -74,6 +74,7 @@ body {
 }
 
 .image-wrap {
+  position: relative;
   width: 100%;
   max-width: 420px;
   aspect-ratio: 1 / 1;
@@ -83,6 +84,48 @@ body {
   align-items: center;
   justify-content: center;
   overflow: hidden;
+}
+
+.drag-overlay-logo, .drag-overlay-text {
+  position: absolute;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  z-index: 5;
+}
+.drag-overlay-logo:active, .drag-overlay-text:active { cursor: grabbing; }
+.drag-overlay-logo {
+  border: 2px dashed var(--accent);
+  border-radius: 6px;
+  opacity: 0.92;
+}
+.drag-overlay-text {
+  font-weight: 800;
+  font-family: Arial, sans-serif;
+  color: #ffffff;
+  -webkit-text-stroke: 1.5px #000;
+  text-shadow: 0 0 3px rgba(0,0,0,0.6);
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  border: 1px dashed var(--accent);
+  border-radius: 4px;
+}
+
+.resize-handle {
+  position: absolute;
+  right: -8px;
+  bottom: -8px;
+  width: 16px;
+  height: 16px;
+  background: var(--accent);
+  border: 2px solid #fff;
+  border-radius: 50%;
+  cursor: nwse-resize;
+  touch-action: none;
+  z-index: 6;
 }
 #preview-image { width: 100%; height: 100%; object-fit: contain; display: block; }
 .image-placeholder {
