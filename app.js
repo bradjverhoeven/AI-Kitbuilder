@@ -41,6 +41,13 @@ const FRAMING_RULE = "Full-length shot: EVERY piece of the outfit must be comple
 // to recolour the garment to blue just because the theme suggests it.
 const COLOR_LOCK_RULE = "Colour rule: keep the exact colours already established on this garment unless the customer explicitly asks to change a colour. Apply any requested pattern, style, or theme (e.g. \"ocean waves\", \"flames\", \"camo\") using ONLY the existing colour palette - do not reinterpret a theme word as a reason to change the colours.";
 
+// BOUNDARY: never invent or substitute a real third-party brand logo/mark
+// (observed happening: a Nike swoosh and a New Balance-style logo appeared
+// on generated garments, completely unprompted). Any logo shown must be
+// EXACTLY whatever the customer's own reference/upload shows -- nothing
+// invented, nothing borrowed from a real brand.
+const NO_TRADEMARKS_RULE = "Logo/brand rule: do NOT add, invent, or substitute any logo, brand mark, or trademark that is not explicitly part of this design brief. In particular, never generate real-world brand logos (e.g. Nike, Adidas, New Balance, Puma, Under Armour, or any other real company's mark) under any circumstances. If a logo is already shown on the reference image, reproduce that exact logo unchanged -- do not redraw, restyle, or replace it with a different mark. If no logo is shown on the reference, the garment has NO logo: leave the chest, sleeve, and every other area of plain fabric completely blank -- no icon, symbol, emblem, swoosh, leaf, animal, letter mark, or any other small graphic of any kind. A blank plain surface is the correct and required result whenever no logo was requested, even though real sportswear almost always has one -- this design must not.";
+
 function fullDesignDescription() {
   let desc = state.designRaw;
   if (state.tweaks.length) desc += ". Adjustments: " + state.tweaks.join("; ");
@@ -49,11 +56,11 @@ function fullDesignDescription() {
 
 
 function buildModelFrontPrompt() {
-  return `Professional sportswear catalog photograph of a model wearing a custom sublimated garment, front view, facing the camera. Design: ${fullDesignDescription()}. Studio lighting, plain light grey background, realistic fabric texture. ${FRAMING_RULE}`;
+  return `Professional sportswear catalog photograph of a model wearing a custom sublimated garment, front view, facing the camera. Design: ${fullDesignDescription()}. Studio lighting, plain light grey background, realistic fabric texture. ${FRAMING_RULE} ${NO_TRADEMARKS_RULE}`;
 }
 
 function buildModelBackEditPrompt() {
-  return `Show the same model wearing the exact same garment, same design, same colours and pattern, but now viewed from behind (back facing the camera). Keep the studio lighting and background identical. ${FRAMING_RULE}`;
+  return `Show the same model wearing the exact same garment, same design, same colours and pattern, but now viewed from behind (back facing the camera). Keep the studio lighting and background identical. ${FRAMING_RULE} ${NO_TRADEMARKS_RULE}`;
 }
 
 // ---------- Backend calls ----------
@@ -595,6 +602,7 @@ async function generateModelShots() {
     pushHistory("Original concept");
 
     addMessage("Here's a concept — front and back. Want any changes, or does this look good?", "bot");
+    addMessage("(Once you're happy with this, logos, names and numbers are next.)", "bot");
     offerTweakOrContinue();
   } catch (err) {
     addMessage(`Image generation failed: ${err.message}. Let's try describing it again.`, "bot");
@@ -608,7 +616,7 @@ async function generateModelShots() {
 async function applyTweak(tweakText) {
   setLoading("Applying your changes…");
   try {
-    const frontPrompt = `Modify this exact garment based on this request: "${tweakText}". ${COLOR_LOCK_RULE} Original design brief for reference: "${state.designRaw}". ${FRAMING_RULE}`;
+    const frontPrompt = `Modify this exact garment based on this request: "${tweakText}". ${COLOR_LOCK_RULE} Original design brief for reference: "${state.designRaw}". ${FRAMING_RULE} ${NO_TRADEMARKS_RULE}`;
     const front = await editImage([state.images.modelFront], frontPrompt);
     state.images.modelFront = front;
     showTab("modelFront");
@@ -650,31 +658,34 @@ function offerTweakOrContinue() {
 // asks if it should go anywhere else too (e.g. the other side) before
 // moving on -- so the same logo/name/number can end up on both front and
 // back without re-uploading or re-typing it.
-function placementLoop(kind, type, content, onDone) {
-  function placeOnce() {
-    addMessage(`Position the ${kind}: drag it into place, switch Front/Back if needed, resize with the corner handle, then confirm.`, "bot");
-    mountDraggablePlacement({
-      kind,
-      type,
-      content,
-      onConfirm: () => {
-        addMessage(`Add this ${kind} anywhere else too (e.g. the other side)?`, "bot");
-        composerChips([
-          { label: "Yes, add another", onClick: placeOnce },
-          { label: "No, that's it", onClick: onDone },
-        ]);
-      },
-      onCancel: onDone,
-    });
-  }
-  placeOnce();
-}
-
 function askLogo() {
   addMessage("Want a logo added? Upload the file, or skip if you don't need one.", "bot");
   composerUploadOnly("Upload logo", () => { state.logo.wanted = false; askName(); }, (dataUrl) => {
     state.logo = { wanted: true, placement: "positioned by drag", dataUrl };
-    placementLoop("logo", "image", dataUrl, askName);
+    placeLogoOnce(dataUrl);
+  });
+}
+
+// Each of logo/name/number re-asks for fresh content on "add another" --
+// a second logo/name/number is usually DIFFERENT (e.g. a sponsor logo on
+// the back, a different name for a different spot), not the same one
+// just repositioned.
+function placeLogoOnce(dataUrl) {
+  addMessage("Position the logo: drag it into place, switch Front/Back if needed, resize with the corner handle, then confirm.", "bot");
+  mountDraggablePlacement({
+    kind: "logo",
+    type: "image",
+    content: dataUrl,
+    onConfirm: () => {
+      addMessage("Do you want to upload another logo?", "bot");
+      composerChips([
+        { label: "Yes", onClick: () => {
+          composerUploadOnly("Upload logo", askName, (newDataUrl) => placeLogoOnce(newDataUrl));
+        } },
+        { label: "No, that's it", onClick: askName },
+      ]);
+    },
+    onCancel: askName,
   });
 }
 
@@ -682,7 +693,29 @@ function askName() {
   addMessage("Want a team or player name added? Tell me what it should say — or skip.", "bot");
   composerTextOnly("e.g. EAGLES", () => { state.name.wanted = false; askNumber(); }, (text) => {
     state.name = { wanted: true, text, placement: "positioned by drag" };
-    placementLoop("name", "text", text, askNumber);
+    placeNameOnce(text);
+  });
+}
+
+// Same reasoning as logo: re-asks for fresh text on "yes" (could be a
+// different name for a different spot) rather than assuming a repeat of
+// the same text.
+function placeNameOnce(text) {
+  addMessage("Position the name: drag it into place, switch Front/Back if needed, resize with the corner handle, then confirm.", "bot");
+  mountDraggablePlacement({
+    kind: "name",
+    type: "text",
+    content: text,
+    onConfirm: () => {
+      addMessage("Do you want to add another name?", "bot");
+      composerChips([
+        { label: "Yes", onClick: () => {
+          composerTextOnly("e.g. EAGLES", askNumber, (newText) => placeNameOnce(newText));
+        } },
+        { label: "No, that's it", onClick: askNumber },
+      ]);
+    },
+    onCancel: askNumber,
   });
 }
 
@@ -690,7 +723,26 @@ function askNumber() {
   addMessage("Want a number added? Tell me the number — or skip.", "bot");
   composerTextOnly("e.g. 9", () => { state.number.wanted = false; askOtherGarments(); }, (text) => {
     state.number = { wanted: true, text, placement: "positioned by drag" };
-    placementLoop("number", "text", text, askOtherGarments);
+    placeNumberOnce(text);
+  });
+}
+
+function placeNumberOnce(text) {
+  addMessage("Position the number: drag it into place, switch Front/Back if needed, resize with the corner handle, then confirm.", "bot");
+  mountDraggablePlacement({
+    kind: "number",
+    type: "text",
+    content: text,
+    onConfirm: () => {
+      addMessage("Do you want to add another number?", "bot");
+      composerChips([
+        { label: "Yes", onClick: () => {
+          composerTextOnly("e.g. 9", askOtherGarments, (newText) => placeNumberOnce(newText));
+        } },
+        { label: "No, that's it", onClick: askOtherGarments },
+      ]);
+    },
+    onCancel: askOtherGarments,
   });
 }
 
@@ -699,7 +751,7 @@ function askOtherGarments() {
   composerChips([
     { label: "Yes", onClick: () => {
       composerText("e.g. shorts, socks, jacket", (val) => {
-        const names = val.split(/[,\n]/).map((s) => s.trim()).filter(Boolean);
+        const names = val.split(/,|\n|&|\band\b/i).map((s) => s.trim()).filter(Boolean);
         generateExtraGarments(names);
       });
     } },
@@ -723,7 +775,7 @@ function finalReviewCheck() {
 
 async function applyFinalTweak(tweakText, onDone) {
   setLoading("Applying your changes…");
-  const buildPrompt = () => `Modify this exact garment based on this request: "${tweakText}". Keep everything else exactly the same, including any logo, name, or number already shown. ${COLOR_LOCK_RULE} ${FRAMING_RULE}`;
+  const buildPrompt = () => `Modify this exact garment based on this request: "${tweakText}". Keep everything else exactly the same, including any logo, name, or number already shown. ${COLOR_LOCK_RULE} ${FRAMING_RULE} ${NO_TRADEMARKS_RULE}`;
   try {
     state.images.modelFront = await editImage([state.images.modelFront], buildPrompt());
     showTab("modelFront");
@@ -749,7 +801,7 @@ async function generateExtraGarments(names) {
     addMessage(`Generating ${name}…`, "bot");
     setLoading(`Generating ${name}…`);
     try {
-      const prompt = `Generate a professional product photograph of a ${name}, using the exact same colours, pattern, and design style as the reference garment shown -- same design family, different item. ${COLOR_LOCK_RULE} ${FRAMING_RULE} Show the ${name} by itself, full item visible, plain studio background.`;
+      const prompt = `Generate a professional product photograph of a single ${name} ONLY -- not a combination or set with any other garment. Replicate the reference garment's pattern EXACTLY: same stripe/pattern layout, same stripe widths, same colours, same logo, in the same positions relative to the garment. Do not invent, add, or embellish with any new graphic elements, shapes, or decorations that are not present in the reference -- this must look like the same design family manufactured as a ${name}, nothing more, nothing less. ${COLOR_LOCK_RULE} ${FRAMING_RULE} ${NO_TRADEMARKS_RULE} Show only the ${name} by itself, full item visible, plain studio background.`;
       const img = await editImage([state.images.modelFront], prompt);
       const label = name[0].toUpperCase() + name.slice(1);
       let key = `extra_${name.toLowerCase().replace(/[^a-z0-9]+/g, "_")}`;
